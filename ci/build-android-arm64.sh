@@ -92,6 +92,8 @@ cmake -S "$core_source" -B "$core_build" \
   -Dtool_base="$tool_base" \
   -DOCPN_ANDROID_CACHEDIR="$support_cache" \
   -DCMAKE_BUILD_TYPE=Release
+cmake --build "$core_build" --target lunasvg \
+  --parallel "${CMAKE_BUILD_PARALLEL_LEVEL:-3}"
 cmake --build "$core_build" --target gorp \
   --parallel "${CMAKE_BUILD_PARALLEL_LEVEL:-3}"
 
