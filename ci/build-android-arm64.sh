@@ -53,7 +53,8 @@ printf '%s  %s\n' "$support_sha256" "$support_zip" | sha256sum --check
 
 # OpenCPN 5.14 unconditionally downloads and extracts this 311 MB archive
 # during CMake configure. Use the verified cache above on fresh CI machines.
-python3 - "$core_source/libs/AndroidLibs.cmake" <<'PY'
+python3 - "$core_source/libs/AndroidLibs.cmake" \
+  "$core_source/buildandroid/build_android.cmake" <<'PY'
 from pathlib import Path
 import sys
 
@@ -69,6 +70,18 @@ for old, new in (
         source = source.replace(old, new, 1)
     elif new not in source:
         raise SystemExit(f'Unexpected OpenCPN Android cache logic in {path}')
+path.write_text(source)
+
+# NDK 26 ships llvm-ar; the legacy aarch64-linux-android-ar alias is absent
+# on fresh SDK installs, making the first static-library link fail.
+path = Path(sys.argv[2])
+source = path.read_text()
+old = 'set(CMAKE_AR ${tool_base}/bin/aarch64-linux-android-ar)'
+new = 'set(CMAKE_AR ${tool_base}/bin/llvm-ar)'
+if old in source:
+    source = source.replace(old, new, 1)
+elif new not in source:
+    raise SystemExit(f'Unexpected OpenCPN Android archiver in {path}')
 path.write_text(source)
 PY
 
