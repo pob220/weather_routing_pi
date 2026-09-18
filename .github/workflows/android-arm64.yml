@@ -1,0 +1,34 @@
+name: Android arm64
+
+on:
+  workflow_dispatch:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  android-arm64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: "2"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Android cross-build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git cmake curl unzip gettext python3 openjdk-17-jdk-headless
+
+      - name: Build OpenCPN 5.14 core and Weather Routing for Android
+        run: bash ci/build-android-arm64.sh
+
+      - name: Retain Android plugin packages
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: weather-routing-android-arm64
+          path: artifacts/android-arm64/
+          if-no-files-found: warn

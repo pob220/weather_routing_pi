@@ -37,10 +37,11 @@ settings and user-data layout remain unchanged.
 
 ## Android arm64 (1.17.12)
 
-The `android-arm64` CircleCI job builds against OpenCPN 5.14 and retains both
-the catalogue package and an `-import.tar.gz` archive for Android's plugin
-manager. Run `bash ci/build-android-arm64.sh` locally with an Android NDK to
-produce the same artifacts in `artifacts/android-arm64/package/`.
+The `android-arm64` CircleCI job and Android GitHub Actions workflow build
+against OpenCPN 5.14 and retain both the catalogue package and an
+`-import.tar.gz` archive for Android's plugin manager. Run
+`bash ci/build-android-arm64.sh` locally with an Android NDK to produce the
+same artifacts in `artifacts/android-arm64/package/`.
 
 On a Galaxy Tab A9+ with Android 15, Weather Routing 1.17.12 loaded in a
 side-by-side OpenCPN 5.14 test build and completed a seven nautical mile
