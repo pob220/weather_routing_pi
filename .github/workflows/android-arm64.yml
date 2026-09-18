@@ -23,7 +23,28 @@ jobs:
           sudo apt-get install -y git cmake curl unzip gettext python3 openjdk-17-jdk-headless
 
       - name: Build OpenCPN 5.14 core and Weather Routing for Android
-        run: bash ci/build-android-arm64.sh
+        run: |
+          set -o pipefail
+          bash ci/build-android-arm64.sh 2>&1 | tee "$RUNNER_TEMP/android-build.log"
+
+      - name: Report Android build errors
+        if: failure()
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          path = Path(os.environ['RUNNER_TEMP']) / 'android-build.log'
+          if path.exists():
+              lines = path.read_text(errors='replace').splitlines()
+              pattern = re.compile(r'error:|fatal:|failed:|CMake Error|Error running link command|No such file or directory', re.I)
+              errors = [line for line in lines if pattern.search(line)]
+              for line in (errors[-8:] or lines[-5:]):
+                  line = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', line)
+                  line = line[:500].replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+                  print(f'::error title=Android build failure::{line}')
+          PY
 
       - name: Retain Android plugin packages
         if: always()
