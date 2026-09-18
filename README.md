@@ -35,6 +35,19 @@ Users of an enhanced OpenCPN host can opt in; explicit choices made by
 existing users are preserved. The established `/PlugIns/WeatherRouting`
 settings and user-data layout remain unchanged.
 
+## Android arm64 (1.17.12)
+
+The `android-arm64` CircleCI job builds against OpenCPN 5.14 and retains both
+the catalogue package and an `-import.tar.gz` archive for Android's plugin
+manager. Run `bash ci/build-android-arm64.sh` locally with an Android NDK to
+produce the same artifacts in `artifacts/android-arm64/package/`.
+
+On a Galaxy Tab A9+ with Android 15, Weather Routing 1.17.12 loaded in a
+side-by-side OpenCPN 5.14 test build and completed a seven nautical mile
+route using seven GRIB frames supplied by xGRIB 0.2.5.3. Selecting a GRIB
+file in this test build required the OpenCPN 5.14 Android file-chooser fix
+on the `fix/android-5.14-plugin-support` core branch.
+
 ## Building
 
 For a clean standalone build against the vendored stock OpenCPN 1.21 API:
