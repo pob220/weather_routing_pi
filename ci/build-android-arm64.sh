@@ -51,6 +51,27 @@ if [[ ! -s "$support_zip" ]]; then
 fi
 printf '%s  %s\n' "$support_sha256" "$support_zip" | sha256sum --check
 
+# OpenCPN 5.14 unconditionally downloads and extracts this 311 MB archive
+# during CMake configure. Use the verified cache above on fresh CI machines.
+python3 - "$core_source/libs/AndroidLibs.cmake" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+source = path.read_text()
+for old, new in (
+    ('if (TRUE) #(NOT EXISTS ${OCPN_ANDROID_CACHEDIR}/support.zip)',
+     'if (NOT EXISTS ${OCPN_ANDROID_CACHEDIR}/support.zip)'),
+    ('if (TRUE) #(NOT EXISTS ${_master_base})',
+     'if (NOT EXISTS ${_master_base})'),
+):
+    if old in source:
+        source = source.replace(old, new, 1)
+    elif new not in source:
+        raise SystemExit(f'Unexpected OpenCPN Android cache logic in {path}')
+path.write_text(source)
+PY
+
 cmake -S "$core_source" -B "$core_build" \
   -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
   -DCMAKE_TOOLCHAIN_FILE="$core_source/buildandroid/build_android.cmake" \
