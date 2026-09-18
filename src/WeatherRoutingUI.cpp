@@ -6,6 +6,7 @@
 ///////////////////////////////////////////////////////////////////////////
 
 #include "WeatherRoutingUI.h"
+#include "WeatherRoutingWxCompat.h"
 #include <vector>
 
 ///////////////////////////////////////////////////////////////////////////
@@ -2443,7 +2444,7 @@ ConfigurationDialogBase::ConfigurationDialogBase(wxWindow* parent,
     m_cShorelineResolution->Append(label);
   m_cShorelineResolution->SetSelection(2);
   m_cShorelineResolution->SetMinSize(wxSize(
-      wxMax(FromDIP(190), m_cShorelineResolution->GetBestSize().x), -1));
+      wxMax(WR_FromDIP(this, 190), m_cShorelineResolution->GetBestSize().x), -1));
   m_cShorelineResolution->SetToolTip(_("GSHHG shoreline detail for the selected engine; Main and Quick remember independent choices. "
                                        "High and Full can be installed with the button below. "
                                        "Chart geometry and minimum-depth checks are separate."));
@@ -2510,7 +2511,7 @@ ConfigurationDialogBase::ConfigurationDialogBase(wxWindow* parent,
   auto shorelineNote = new wxStaticText(sbOptions1->GetStaticBox(), wxID_ANY,
       _("Lower shoreline resolutions omit smaller coastal features and may allow "
         "routes through land shown at higher resolutions. Chart and depth checks are separate."));
-  shorelineNote->Wrap(FromDIP(440));
+  shorelineNote->Wrap(WR_FromDIP(this, 440));
   fgSizer113->Insert(2, shorelineNote, 0, wxALL, 5);
 
   sbOptions1->Add(fgSizer113, 1, wxEXPAND, 5);

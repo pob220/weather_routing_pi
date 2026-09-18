@@ -125,6 +125,26 @@ jobs:
       - store_artifacts:
           path: artifacts/macos-arm64
 
+  android-arm64:
+    machine:
+      image: ubuntu-2404:current
+    resource_class: large
+    environment:
+      CMAKE_BUILD_PARALLEL_LEVEL: "4"
+    steps:
+      - checkout
+      - run:
+          name: Install Android cross-build tools
+          command: |
+            sudo apt-get update
+            sudo apt-get install -y git cmake curl unzip gettext python3 openjdk-17-jdk-headless
+      - run:
+          name: Build OpenCPN 5.14 core and Weather Routing 1.17.12 for Android arm64
+          command: bash ci/build-android-arm64.sh
+          no_output_timeout: 60m
+      - store_artifacts:
+          path: artifacts/android-arm64
+
 workflows:
   validate:
     jobs:
@@ -171,4 +191,6 @@ workflows:
       - windows-x86:
           filters: *validation-filters
       - macos-universal:
+          filters: *validation-filters
+      - android-arm64:
           filters: *validation-filters
