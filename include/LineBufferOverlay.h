@@ -1,9 +1,4 @@
 /***************************************************************************
- *
- * Project:  OpenCPN Weather Routing plugin
- * Author:   Sean D'Epagnier
- *
- ***************************************************************************
  *   Copyright (C) 2015 by Sean D'Epagnier                                 *
  *                                                                         *
  *   This program is free software; you can redistribute it and/or modify  *
@@ -20,8 +15,10 @@
  *   along with this program; if not, write to the                         *
  *   Free Software Foundation, Inc.,                                       *
  *   51 Franklin Street, Fifth Floor, Boston, MA 02110-1301,  USA.         *
- ***************************************************************************
- */
+ **************************************************************************/
+
+#ifndef _WEATHER_ROUTING_LINE_BUFFER_OVERLAY_H_
+#define _WEATHER_ROUTING_LINE_BUFFER_OVERLAY_H_
 
 #include "wx/wx.h"
 
@@ -33,45 +30,53 @@
 
 class LineBuffer {
 public:
-    LineBuffer() { count = 0; lines = NULL; }
-    ~LineBuffer() { delete [] lines; }
+  LineBuffer() {
+    count = 0;
+    lines = nullptr;
+  }
+  ~LineBuffer() { delete[] lines; }
 
-    void pushLine( float x0, float y0, float x1, float y1 );
-    void Finalize();
+  void pushLine(float x0, float y0, float x1, float y1);
+  void Finalize();
 
-    void pushTransformedBuffer(LineBuffer &buffer, int x, int y, double ang, bool south=false, bool head=false, int lineWidth=DEFAULT_WIND_ARROW_SIZE);
-    void draw(wxDC *dc);
-    void drawTransformed(wxDC *dc, wxPoint offset, double ang);
+  void pushTransformedBuffer(LineBuffer& buffer, int x, int y, double ang,
+                             bool south = false, bool head = false,
+                             int lineWidth = DEFAULT_WIND_ARROW_SIZE);
+  void draw(wxDC* dc);
+  void drawTransformed(wxDC* dc, wxPoint offset, double ang);
 
-    int count;
-    float *lines;
+  int count;
+  float* lines;
 
 private:
-    std::list <float> buffer;
+  std::list<float> buffer;
 };
 
-class WindBarbLineBuffer : public LineBuffer
-{
+class WindBarbLineBuffer : public LineBuffer {
 public:
-    void pushPetiteBarbule( int b, int lineWidth=DEFAULT_WIND_ARROW_SIZE );
-    void pushGrandeBarbule( int b, int lineWidth=DEFAULT_WIND_ARROW_SIZE );
-    void pushTriangle( int b, int lineWidth=DEFAULT_WIND_ARROW_SIZE );
+  void pushPetiteBarbule(int b, int lineWidth = DEFAULT_WIND_ARROW_SIZE);
+  void pushGrandeBarbule(int b, int lineWidth = DEFAULT_WIND_ARROW_SIZE);
+  void pushTriangle(int b, int lineWidth = DEFAULT_WIND_ARROW_SIZE);
 };
 
-class LineBufferOverlay
-{
+class LineBufferOverlay {
 public:
-    LineBufferOverlay();
-    void setLineBuffer();
-    void setLineWidth(int lineWidth);
-    void pushWindArrowWithBarbs(LineBuffer &buffer, int x, int y, double vkn, double ang, bool south=false, bool head=false);
-    void pushSingleArrow( LineBuffer &buffer, int x, int y, double vkn, double ang, bool south=false);
+  LineBufferOverlay();
+  void setLineBuffer();
+  void setLineWidth(int lineWidth);
+  void pushWindArrowWithBarbs(LineBuffer& buffer, int x, int y, double vkn,
+                              double ang, bool south = false,
+                              bool head = false);
+  void pushSingleArrow(LineBuffer& buffer, int x, int y, double vkn, double ang,
+                       bool south = false);
+
 private:
-
-    WindBarbLineBuffer m_WindArrowCache[14];
-    LineBuffer m_SingleArrow[14];
-    int m_lineWidth;
+  WindBarbLineBuffer m_WindArrowCache[14];
+  LineBuffer m_SingleArrow[14];
+  int m_lineWidth;
 };
 
 extern LineBufferOverlay g_LineBufferOverlay;
 extern LineBufferOverlay g_barbsOnRoute_LineBufferOverlay;
+
+#endif

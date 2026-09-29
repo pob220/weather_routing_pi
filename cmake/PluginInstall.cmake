@@ -2,6 +2,15 @@
 # Author:      Pavel Kalian (Based on the work of Sean D'Epagnier) Copyright:
 # 2014 License:     GPLv3+
 # ---------------------------------------------------------------------------
+# Install the plugin binary
+# Install plugin data (shorelines, icons, etc.)
+# Handle platform‑specific install paths
+# Handle macOS bundle quirks
+# Handle Linux packaging paths
+# Handle Windows plugin directory layout
+# Handle Flatpak exclusions
+# Handle MinGW/MSVC differences
+# Handle Android special cases
 
 set(SAVE_CMLOC ${CMLOC})
 set(CMLOC "PluginInstall: ")
@@ -11,25 +20,25 @@ if (OCPN_FLATPAK_CONFIG)
 endif (OCPN_FLATPAK_CONFIG)
 
 if (NOT APPLE)
-  target_link_libraries(${PACKAGE_NAME} ${wxWidgets_LIBRARIES} ${EXTRA_LIBS})
-endif (NOT APPLE)
+  target_link_libraries(${PACKAGE_NAME} PRIVATE ${wxWidgets_LIBRARIES} ${EXTRA_LIBS})
+endif ()
 
 if (WIN32)
   if (MSVC)
     # TARGET_LINK_LIBRARIES(${PACKAGE_NAME} gdiplus.lib glu32.lib)
-    target_link_libraries(${PACKAGE_NAME} ${OPENGL_LIBRARIES})
+    target_link_libraries(${PACKAGE_NAME} PRIVATE ${OPENGL_LIBRARIES})
     # add_subdirectory(libs/ocpn-api) target_link_libraries(${PACKAGE_NAME}
     # ocpn::api) message(STATUS "${CMLOC}Added ocpn-api for MSVC")
-  endif (MSVC)
+  endif ()
 
   if (MINGW)
+    add_definitions(" -DUNICODE")
     # assuming wxwidgets is compiled with unicode, this is needed for mingw
     # headers
-    add_definitions(" -DUNICODE")
-    target_link_libraries(${PACKAGE_NAME} ${OPENGL_LIBRARIES})
-    set(CMAKE_SHARED_LINKER_FLAGS "-L../buildwin")
+    target_link_libraries(${PACKAGE_NAME} PRIVATE ${OPENGL_LIBRARIES})
     # add_subdirectory(libs/ocpn-api) target_link_libraries(${PACKAGE_NAME}
     # ocpn::api) message(STATUS "${CMLOC}Added ocpn-api for MINGW")
+    set(CMAKE_SHARED_LINKER_FLAGS "-L../buildwin")
   endif (MINGW)
 endif (WIN32)
 
@@ -40,52 +49,22 @@ if (UNIX)
       NAMES gcov
       PATHS /usr/lib/gcc/i686-pc-linux-gnu/4.7
     )
-
     set(EXTRA_LIBS ${EXTRA_LIBS} ${GCOV_LIBRARY})
   endif (PROFILING)
 endif (UNIX)
 
-if (UNIX
-    AND NOT APPLE
-    AND NOT QT_ANDROID
-)
+
+if (UNIX AND NOT APPLE AND NOT QT_ANDROID)
   find_package(BZip2 REQUIRED)
   include_directories(${BZIP2_INCLUDE_DIR})
   find_package(ZLIB REQUIRED)
   include_directories(${ZLIB_INCLUDE_DIR})
-  target_link_libraries(${PACKAGE_NAME} ${BZIP2_LIBRARIES} ${ZLIB_LIBRARY})
-endif (
-  UNIX
-  AND NOT APPLE
-  AND NOT QT_ANDROID
-)
+  target_link_libraries(${PACKAGE_NAME} 
+	PRIVATE ${BZIP2_LIBRARIES}
+	PRIVATE ${ZLIB_LIBRARY})
+endif ()
 
 set(PARENT opencpn)
-
-if (APPLE)
-  install(
-    TARGETS ${PACKAGE_NAME}
-    RUNTIME
-    LIBRARY DESTINATION OpenCPN.app/Contents/PlugIns
-  )
-  if (EXISTS ${PROJECT_SOURCE_DIR}/data)
-    install(
-      DIRECTORY data
-      DESTINATION OpenCPN.app/Contents/SharedSupport/plugins/${PACKAGE_NAME}
-    )
-  endif ()
-
-  if (EXISTS ${PROJECT_SOURCE_DIR}/UserIcons)
-    install(
-      DIRECTORY UserIcons
-      DESTINATION OpenCPN.app/Contents/SharedSupport/plugins/${PACKAGE_NAME}
-    )
-  endif ()
-
-  find_package(ZLIB REQUIRED)
-  target_link_libraries(${PACKAGE_NAME} ${ZLIB_LIBRARIES})
-
-endif (APPLE)
 
 # Based on code from nohal
 if (NOT CMAKE_INSTALL_PREFIX)
@@ -99,8 +78,8 @@ set(PREFIX_PKGDATA ${PREFIX_DATA}/${PACKAGE_NAME})
 set(PREFIX_LIB lib)
 
 if (WIN32)
-  message(STATUS "${CMLOC}Install Prefix: ${CMAKE_INSTALL_PREFIX}")
   set(CMAKE_INSTALL_PREFIX ${CMAKE_INSTALL_PREFIX}/../OpenCPN)
+  message(STATUS "${CMLOC}Install Prefix: ${CMAKE_INSTALL_PREFIX}")
   if (CMAKE_CROSSCOMPILING)
     install(TARGETS ${PACKAGE_NAME} RUNTIME DESTINATION "plugins")
     set(INSTALL_DIRECTORY "plugins/${PACKAGE_NAME}")
@@ -115,7 +94,9 @@ if (WIN32)
   endif (EXISTS ${PROJECT_SOURCE_DIR}/UserIcons)
 
   if (EXISTS ${PROJECT_SOURCE_DIR}/data)
-    install(DIRECTORY data DESTINATION "${INSTALL_DIRECTORY}")
+    install(DIRECTORY data DESTINATION "${INSTALL_DIRECTORY}"
+            PATTERN "poly-h-2.3.7.dat.gz" EXCLUDE
+            PATTERN "poly-f-2.3.7.dat.gz" EXCLUDE)
     message(STATUS "${CMLOC}Install Data: ${INSTALL_DIRECTORY}")
   endif (EXISTS ${PROJECT_SOURCE_DIR}/data)
 
@@ -137,11 +118,10 @@ if (UNIX AND NOT APPLE)
   if (EXISTS ${PROJECT_SOURCE_DIR}/data)
     install(DIRECTORY data
             DESTINATION ${PREFIX_PARENTDATA}/plugins/${PACKAGE_NAME}
+            PATTERN "poly-h-2.3.7.dat.gz" EXCLUDE
+            PATTERN "poly-f-2.3.7.dat.gz" EXCLUDE
     )
-    message(
-      STATUS
-        "${CMLOC}Install data: ${PREFIX_PARENTDATA}/plugins/${PACKAGE_NAME}"
-    )
+    message(STATUS "${CMLOC}Install data: ${PREFIX_PARENTDATA}/plugins/${PACKAGE_NAME}")
   endif ()
   if (EXISTS ${PROJECT_SOURCE_DIR}/UserIcons)
     install(DIRECTORY UserIcons
@@ -153,35 +133,46 @@ if (UNIX AND NOT APPLE)
     set(CPACK_RPM_POST_INSTALL_SCRIPT_FILE
         "${PROJECT_SOURCE_DIR}/script/postinst"
     )
-    message(
-      STATUS
-        "${CMLOC}Install UserIcons: ${PREFIX_PARENTDATA}/plugins/${PACKAGE_NAME}"
-    )
+    message(STATUS "${CMLOC}Install UserIcons: ${PREFIX_PARENTDATA}/plugins/${PACKAGE_NAME}")
   endif ()
 endif (UNIX AND NOT APPLE)
 
 if (APPLE)
-  message(STATUS "${CMLOC}Install Prefix: ${CMAKE_INSTALL_PREFIX}")
+  # On macos, fix paths which points to the build environment, make sure they
+  # refers to runtime locations
+  message(STATUS "${CMLOC}Adjusting library paths")
+  install(CODE "execute_process(
+      COMMAND bash ${PROJECT_SOURCE_DIR}/cmake/fix-macos-libs.sh
+    )"
+  )
+
+  find_package(ZLIB REQUIRED)
+  target_link_libraries(${PACKAGE_NAME} PRIVATE ${ZLIB_LIBRARIES})
 
   # For Apple build, we need to copy the "data" directory contents to the build
   # directory, so that the packager can pick them up.
-  if (NOT EXISTS "${PROJECT_BINARY_DIR}/data/")
-    file(MAKE_DIRECTORY "${PROJECT_BINARY_DIR}/data/")
-    message("Generating data directory")
+
+  if (NOT EXISTS "${CMAKE_CURRENT_BINARY_DIR}/data/")
+    message(STATUS "${CMLOC}Making directory ${CMAKE_CURRENT_BINARY_DIR}/data/")
+    file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/data/")
   endif ()
 
-  file(
-    GLOB_RECURSE PACKAGE_DATA_FILES
-    LIST_DIRECTORIES true
-    ${PROJECT_SOURCE_DIR}/data/*
-  )
-
-  foreach (_currentDataFile ${PACKAGE_DATA_FILES})
-    message(STATUS "${CMLOC}copying: ${_currentDataFile}")
-    file(COPY ${_currentDataFile} DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/data)
-  endforeach (_currentDataFile)
+  # Preserve subdirectories; a recursive glob copied nested files again at
+  # the root and would duplicate the 55 MiB shoreline archive in Mac packages.
+  file(REMOVE "${CMAKE_CURRENT_BINARY_DIR}/data/shoreline/poly-h-2.3.7.dat.gz"
+              "${CMAKE_CURRENT_BINARY_DIR}/data/shoreline/poly-f-2.3.7.dat.gz")
+  file(COPY "${PROJECT_SOURCE_DIR}/data/"
+       DESTINATION "${CMAKE_CURRENT_BINARY_DIR}/data"
+       PATTERN "poly-h-2.3.7.dat.gz" EXCLUDE
+       PATTERN "poly-f-2.3.7.dat.gz" EXCLUDE)
 
   if (EXISTS ${PROJECT_SOURCE_DIR}/UserIcons)
+    if (NOT EXISTS "${CMAKE_CURRENT_BINARY_DIR}/UserIcons/")
+      message(STATUS "${CMLOC}Making directory ${CMAKE_CURRENT_BINARY_DIR}/UserIcons/")
+      file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/UserIcons/")
+    endif ()
+
+    message(STATUS "${CMLOC}Globbing for data icons in ${PROJECT_SOURCE_DIR}/UserIcons/*")
     file(
       GLOB_RECURSE PACKAGE_DATA_FILES
       LIST_DIRECTORIES true
@@ -189,28 +180,36 @@ if (APPLE)
     )
 
     foreach (_currentDataFile ${PACKAGE_DATA_FILES})
-      message(STATUS "${CMLOC}copying: ${_currentDataFile}")
+      message(STATUS "${CMLOC}Copying ${_currentDataFile} to ${CMAKE_CURRENT_BINARY_DIR}/UserIcons")
       file(COPY ${_currentDataFile}
            DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/UserIcons
       )
     endforeach (_currentDataFile)
   endif ()
 
-  # On macos, fix paths which points to the build environment, make sure they
-  # refers to runtime locations
-  message(STATUS "${CMLOC}copying: Adjusting MacOS library paths")
-  install(CODE "execute_process(
-      COMMAND bash ${PROJECT_SOURCE_DIR}/cmake/fix-macos-libs.sh
-    )"
-  )
-
+  message(STATUS "${CMLOC}Installing target to OpenCPN.app/Contents/PlugIns")
   install(
     TARGETS ${PACKAGE_NAME}
     RUNTIME
     LIBRARY DESTINATION OpenCPN.app/Contents/PlugIns
   )
-  message(STATUS "${CMLOC}Install Target: OpenCPN.app/Contents/PlugIns")
+  
+  if (EXISTS ${PROJECT_SOURCE_DIR}/data)
+    install(
+      DIRECTORY data
+      DESTINATION OpenCPN.app/Contents/SharedSupport/plugins/${PACKAGE_NAME}
+      PATTERN "poly-h-2.3.7.dat.gz" EXCLUDE
+      PATTERN "poly-f-2.3.7.dat.gz" EXCLUDE
+    )
+  endif ()
 
+  if (EXISTS ${PROJECT_SOURCE_DIR}/UserIcons)
+    install(
+      DIRECTORY UserIcons
+      DESTINATION OpenCPN.app/Contents/SharedSupport/plugins/${PACKAGE_NAME}
+    )
+  endif ()
+  
 endif (APPLE)
 
 set(CMLOC ${SAVE_CMLOC})

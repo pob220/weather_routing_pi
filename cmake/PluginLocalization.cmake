@@ -1,6 +1,14 @@
 # ---------------------------------------------------------------------------
 # Author:      Pavel Kalian / Sean D'Epagnier Copyright: License:     GPLv3+
 # ---------------------------------------------------------------------------
+# Build POTFILES.in
+# Generate .pot
+# Merge .po
+# Build .mo
+# Install .mo into correct platform‑specific locations
+# Handle macOS bundle quirks
+# Handle Flatpak exclusion
+
 
 set(SAVE_CMLOC ${CMLOC})
 set(CMLOC "PluginLocalization: ")
@@ -49,7 +57,7 @@ if (GETTEXT_XGETTEXT_EXECUTABLE)
   add_custom_command(
     OUTPUT po/${PACKAGE_NAME}.pot.dummy
     COMMAND
-      ${GETTEXT_XGETTEXT_EXECUTABLE} --force-po -F
+      ${GETTEXT_XGETTEXT_EXECUTABLE} --force-po -F --from-code=UTF-8
       --package-name=${PACKAGE_NAME} --package-version="${PACKAGE_VERSION}"
       --output=po/${PACKAGE_NAME}.pot --keyword=_ --width=80
       --files-from=${CMAKE_CURRENT_SOURCE_DIR}/po/POTFILES.in

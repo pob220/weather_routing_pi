@@ -1,9 +1,4 @@
 /***************************************************************************
- *
- * Project:  OpenCPN Weather Routing plugin
- * Author:   Sean D'Epagnier
- *
- ***************************************************************************
  *   Copyright (C) 2016 by Sean D'Epagnier                                 *
  *                                                                         *
  *   This program is free software; you can redistribute it and/or modify  *
@@ -19,44 +14,42 @@
  *   You should have received a copy of the GNU General Public License     *
  *   along with this program; if not, write to the                         *
  *   Free Software Foundation, Inc.,                                       *
- *   51 Franklin Street, Fifth Floor, Boston, MA 02110-1301,  USA.             *
- ***************************************************************************
- */
+ *   51 Franklin Street, Fifth Floor, Boston, MA 02110-1301,  USA.         *
+ **************************************************************************/
 
-#ifndef _EDITPOLAR_DIALOG_H_
-#define _EDITPOLAR_DIALOG_H_
+#ifndef _WEATHER_ROUTING_EDITPOLAR_DIALOG_H_
+#define _WEATHER_ROUTING_EDITPOLAR_DIALOG_H_
 
 #include "WeatherRoutingUI.h"
 
 class BoatDialog;
 
 class Polar;
-class EditPolarDialog : public EditPolarDialogBase
-{
+class EditPolarDialog : public EditPolarDialogBase {
 public:
-    EditPolarDialog(wxWindow *parent);
+  EditPolarDialog(wxWindow* parent);
 
-    void SetPolarIndex(int i);
+  void SetPolarIndex(int i);
 
 private:
-    void OnPolarGridChanged( wxGridEvent& event );
-    void OnAddTrueWindAngle( wxCommandEvent& event );
-    void OnRemoveTrueWindAngle( wxCommandEvent& event );
-    void OnAddTrueWindSpeed( wxCommandEvent& event );
-    void OnRemoveTrueWindSpeed( wxCommandEvent& event );
-    void OnAddMeasurement( wxCommandEvent& event );
-    void OnRemoveMeasurement( wxCommandEvent& event );
-    void OnRemoveAllMeasurements( wxCommandEvent& event );
-    void OnGeneratePolar( wxCommandEvent& event );
-    void OnSave( wxCommandEvent& event ) { EndModal(wxID_SAVE); }
+  void OnPolarGridChanged(wxGridEvent& event);
+  void OnAddTrueWindAngle(wxCommandEvent& event);
+  void OnRemoveTrueWindAngle(wxCommandEvent& event);
+  void OnAddTrueWindSpeed(wxCommandEvent& event);
+  void OnRemoveTrueWindSpeed(wxCommandEvent& event);
+  void OnAddMeasurement(wxCommandEvent& event);
+  void OnRemoveMeasurement(wxCommandEvent& event);
+  void OnRemoveAllMeasurements(wxCommandEvent& event);
+  void OnGeneratePolar(wxCommandEvent& event);
+  void OnSave(wxCommandEvent& event) { EndModal(wxID_SAVE); }
 
-    void RebuildTrueWindAngles();
-    void RebuildTrueWindSpeeds();
-    void RebuildGrid();
-    Polar *GetPolar();
+  void RebuildTrueWindAngles();
+  void RebuildTrueWindSpeeds();
+  void RebuildGrid();
+  Polar* GetPolar();
 
-    int polarindex;
-    BoatDialog *m_BoatDialog;
+  int polarindex;
+  BoatDialog* m_BoatDialog;
 };
 
 #endif

@@ -1,9 +1,4 @@
-/******************************************************************************
- *
- * Project:  OpenCPN Weather Routing plugin
- * Author:   Sean D'Epagnier
- *
- ***************************************************************************
+/***************************************************************************
  *   Copyright (C) 2015 by Sean D'Epagnier                                 *
  *                                                                         *
  *   This program is free software; you can redistribute it and/or modify  *
@@ -20,50 +15,72 @@
  *   along with this program; if not, write to the                         *
  *   Free Software Foundation, Inc.,                                       *
  *   51 Franklin Street, Fifth Floor, Boston, MA 02110-1301,  USA.         *
- ***************************************************************************
- */
+ **************************************************************************/
+
+#ifndef _WEATHER_ROUTING_PI_H_
+#define _WEATHER_ROUTING_PI_H_
+
 #ifdef DEBUG_BUILD
-#  define DEBUGSL(x) do { \
-time_t now = time(0); \
-tm* localtm = localtime(&now); \
-char *stime = asctime(localtm); \
-stime[strlen(stime) - 1 ] = 0; \
-std::cout << stime << " : " << x << std::endl; } while (0)
+#define DEBUGSL(x)                                 \
+  do {                                             \
+    time_t now = time(0);                          \
+    tm* localtm = localtime(&now);                 \
+    char* stime = asctime(localtm);                \
+    stime[strlen(stime) - 1] = 0;                  \
+    std::cout << stime << " : " << x << std::endl; \
+  } while (0)
 
-#  define DEBUGST(x) do { \
-time_t now = time(0); \
-tm* localtm = localtime(&now); \
-char *stime = asctime(localtm); \
-stime[strlen(stime) - 1 ] = 0; \
-std::cout << stime << " : " << x; } while (0)
+#define DEBUGST(x)                    \
+  do {                                \
+    time_t now = time(0);             \
+    tm* localtm = localtime(&now);    \
+    char* stime = asctime(localtm);   \
+    stime[strlen(stime) - 1] = 0;     \
+    std::cout << stime << " : " << x; \
+  } while (0)
 
-#  define DEBUGCONT(x) do { \
-std::cout << x ; } while (0)
+#define DEBUGCONT(x) \
+  do {               \
+    std::cout << x;  \
+  } while (0)
 
-#  define DEBUGEND(x) do { \
-std::cout << x << std::endl; } while (0)
+#define DEBUGEND(x)              \
+  do {                           \
+    std::cout << x << std::endl; \
+  } while (0)
 #else
-#  define DEBUGSL(x) do {} while (0)
-#  define DEBUGST(x) do {} while (0)
-#  define DEBUGCONT(x) do {} while (0)
-#  define DEBUGEND(x) do {} while (0)
+#define DEBUGSL(x) \
+  do {             \
+  } while (0)
+#define DEBUGST(x) \
+  do {             \
+  } while (0)
+#define DEBUGCONT(x) \
+  do {               \
+  } while (0)
+#define DEBUGEND(x) \
+  do {              \
+  } while (0)
 #endif
 
 #ifndef _WEATHER_ROUTINGPI_H_
 #define _WEATHER_ROUTINGPI_H_
 
-//#ifndef __OCPN__ANDROID__
+// #ifndef __OCPN__ANDROID__
 #define GetDateCtrlValue GetValue
 #define GetTimeCtrlValue GetValue
-//#endif
+// #endif
 
 #include "version.h"
 
 #define ABOUT_AUTHOR_URL "http://seandepagnier.users.sourceforge.net"
 
 #include "ocpn_plugin.h"
+#include "ChartSafetyCache.h"
 #include "pidc.h"
 #include "qtstylesheet.h"
+
+#include <wx/eventfilter.h>
 
 /* make some warnings go away */
 #ifdef MIN
@@ -76,85 +93,212 @@ std::cout << x << std::endl; } while (0)
 
 #include <json/json.h>
 
+#ifdef __WXMSW__
+#include "AddressSpaceMonitor.h"
+#endif
+
+#include <atomic>
+#include <future>
+#include <memory>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
+
+class ExternalPlanningProvider;
+
 //----------------------------------------------------------------------------------------------------------
 //    The PlugIn Class Definition
 //----------------------------------------------------------------------------------------------------------
 
-#define WEATHER_ROUTING_TOOL_POSITION    -1          // Request default positioning of toolbar tool
+#define WEATHER_ROUTING_TOOL_POSITION \
+  -1  // Request default positioning of toolbar tool
 
 class WeatherRouting;
 
-class weather_routing_pi : public wxEvtHandler, public opencpn_plugin_117
-{
+/**
+ * OpenCPN Weather Routing plugin main class.
+ *
+ * Implements the OpenCPN Weather Routing plugin that provides
+ * weather routing capabilities to OpenCPN. It handles initialization,
+ * UI management, and interactions with the OpenCPN application.
+ */
+class weather_routing_pi : public wxEvtHandler,
+                           public wxEventFilter,
+                           public opencpn_plugin_121 {
 public:
-      weather_routing_pi(void *ppimgr);
-      ~weather_routing_pi();
+  weather_routing_pi(void* ppimgr);
+  ~weather_routing_pi();
 
-      int Init();
-      bool DeInit();
+  int Init();
+  bool DeInit();
 
-      int GetAPIVersionMajor();
-      int GetAPIVersionMinor();
-      int GetPlugInVersionMajor();
-      int GetPlugInVersionMinor();
-      int GetPlugInVersionPatch();
-      int GetPlugInVersionPost();
-	  
-      wxBitmap *GetPlugInBitmap();
-      wxString GetCommonName();
-      wxString GetShortDescription();
-      wxString GetLongDescription();
-	  //from Shipdriver for definition of panel icon
-	  wxBitmap m_panelBitmap;
+  int GetAPIVersionMajor();
+  int GetAPIVersionMinor();
+  int GetPlugInVersionMajor();
+  int GetPlugInVersionMinor();
+  int GetPlugInVersionPatch();
+  int GetPlugInVersionPost();
 
-      bool InBoundary(double lat, double lon);
+  wxBitmap* GetPlugInBitmap();
+  wxString GetCommonName();
+  wxString GetShortDescription();
+  wxString GetLongDescription();
+  // from Shipdriver for definition of panel icon
+  wxBitmap m_panelBitmap;
 
-      bool RenderOverlay(wxDC &dc, PlugIn_ViewPort *vp);
-      bool RenderGLOverlay(wxGLContext *pcontext, PlugIn_ViewPort *vp);
+  bool InBoundary(double lat, double lon);
 
-      void SetDefaults();
+  bool RenderOverlay(wxDC& dc, PlugIn_ViewPort* vp);
+  bool RenderGLOverlay(wxGLContext* pcontext, PlugIn_ViewPort* vp);
 
-      int GetToolbarToolCount();
+  void SetDefaults();
 
-      void SetCursorLatLon(double lat, double lon);
+  int GetToolbarToolCount();
 
-      void SetPluginMessage(wxString &message_id, wxString &message_body);
-      void SetPositionFixEx(PlugIn_Position_Fix_Ex &pfix);
-      void ShowPreferencesDialog( wxWindow* parent );
+  /**
+   * Receives cursor lat/lon position updates.
+   *
+   * @param lat Latitude of the cursor.
+   * @param lon Longitude of the cursor.
+   */
+  void SetCursorLatLon(double lat, double lon);
 
-      void OnToolbarToolCallback(int id);
-      void OnContextMenuItemCallback(int id);
+  void SetPluginMessage(wxString& message_id, wxString& message_body);
+  /**
+   * Handle position fix information (boat position).
+   *
+   * @param pfix Position fix information.
+   */
+  void SetPositionFixEx(PlugIn_Position_Fix_Ex& pfix);
+  void ShowPreferencesDialog(wxWindow* parent);
 
-      void SetColorScheme(PI_ColorScheme cs);
-      static wxString StandardPath();
-      void ShowMenuItems(bool show);
+  void OnToolbarToolCallback(int id);
+  void OnContextMenuItemCallback(int id);
 
-      double m_boat_lat, m_boat_lon;
-      double m_cursor_lat, m_cursor_lon;
+  void SetColorScheme(PI_ColorScheme cs);
+  int FilterEvent(wxEvent& event) override;
+  static wxString StandardPath();
+  void ShowMenuItems(bool show);
+  bool UsePersistentChartSafeCache() const {
+    return m_use_persistent_chart_safe_cache;
+  }
+  void SetUsePersistentChartSafeCache(bool enabled, bool save = true);
+  int ChartSafetyRamCacheMiB() const {
+    return m_chart_safety_ram_cache_mib;
+  }
+  int EffectiveChartSafetyRamCacheMiB() const {
+    return m_chart_safety_cache.EffectiveRamMiB();
+  }
+  void SetChartSafetyRamCacheMiB(int ram_mib);
+  bool ChartSafetyAtlasEnabled() const {
+    return m_chart_safety_atlas_enabled;
+  }
+  int ChartSafetyAtlasMaxDiskMiB() const {
+    return m_chart_safety_atlas_max_disk_mib;
+  }
+  bool ChartSafetyAtlasAllCharts() const {
+    return m_chart_safety_atlas_all_charts;
+  }
+  const std::set<std::string>& ChartSafetyAtlasSelectedPaths() const {
+    return m_chart_safety_atlas_selected_paths;
+  }
+  void SetChartSafetyAtlasSettings(bool enabled, int max_disk_mib,
+                                   bool all_charts,
+                                   std::set<std::string> selected_paths);
+  bool ClearChartSafetyCache();
+  bool FlushChartSafetyCache();
+  bool HasEnhancedChartSafety() const;
+  bool StartExternalPlanningScenario(const wxString& scenario_path,
+                                     const wxString& output_path,
+                                     long timeout_ms);
+  void CancelExternalPlanningScenario();
+  void ClearExternalPlanningScenario();
+  weather_routing::ChartSafetyCacheStats ChartSafetyCacheStatistics() const {
+    return m_chart_safety_cache.Stats();
+  }
+
+  wxWindow* GetParentWindow() { return m_parent_window; }
+
+#ifdef __WXMSW__
+  AddressSpaceMonitor& GetAddressSpaceMonitor() {
+    return m_addressSpaceMonitor;
+  }
+#endif
+
+  double m_boat_lat;    //!< Latitude of the boat position, in degrees.
+  double m_boat_lon;    //!< Longitude of the boat position, in degrees.
+  double m_cursor_lat;  //!< Latitude of the cursor position, in degrees.
+  double m_cursor_lon;  //!< Longitude of the cursor position, in degrees.
 
 private:
-      void OnCursorLatLonTimer( wxTimerEvent & );
-      void RequestOcpnDrawSetting();
-      void NewWR();
+  friend class HeadlessRouteTestStarter;
 
-      bool LoadConfig();
-      bool SaveConfig();
+  void OnCursorLatLonTimer(wxTimerEvent&);
+  void RequestOcpnDrawSetting();
+  void NewWR();
+  void MaybeStartHeadlessRouteTest();
+  void ScheduleChartSafetyAtlas(bool rebuild_plan, int delay_ms = 1000);
+  void OnChartSafetyAtlasTimer(wxTimerEvent&);
+  void ResetChartSafetyAtlasPlan();
+  bool ChartSafetyAtlasGuiIdle() const;
+  void WaitForChartSafetyAtlasInspection();
+#ifdef __WXMSW__
+  void OnAddressSpaceTimer(wxTimerEvent& event);
+#endif
 
-      bool	       b_in_boundary_reply;
+  bool LoadConfig();
+  bool SaveConfig();
 
-      wxFileConfig     *m_pconfig;
-      wxWindow         *m_parent_window;
+  bool b_in_boundary_reply;
+  bool m_use_persistent_chart_safe_cache;
+  int m_chart_safety_ram_cache_mib;
+  bool m_chart_safety_atlas_enabled;
+  int m_chart_safety_atlas_max_disk_mib;
+  bool m_chart_safety_atlas_all_charts;
+  std::set<std::string> m_chart_safety_atlas_selected_paths;
+  std::string m_chart_safety_atlas_completed_identity;
+  std::string m_chart_safety_atlas_plan_identity;
+  std::vector<std::pair<long, long>> m_chart_safety_atlas_coverage_tiles;
+  std::vector<std::pair<long, long>> m_chart_safety_atlas_tiles;
+  std::size_t m_chart_safety_atlas_cursor{0};
+  int m_chart_safety_atlas_metadata_attempts{0};
+  int m_chart_safety_atlas_batch_retries{0};
+  std::size_t m_chart_safety_atlas_failed_batches{0};
+  bool m_chart_safety_atlas_logged_route_pause{false};
+  bool m_chart_safety_atlas_logged_user_pause{false};
+  bool m_chart_safety_atlas_plan_ready{false};
+  bool m_chart_safety_atlas_filter_installed{false};
+  std::size_t m_chart_safety_atlas_batch_limit{1};
+  std::size_t m_chart_safety_atlas_selected_charts{0};
+  double m_chart_safety_atlas_estimate_mib{0.0};
+  std::atomic<long long> m_chart_safety_atlas_last_input_ms{0};
+  std::future<weather_routing::ChartSafetyAtlasCacheStatus>
+      m_chart_safety_atlas_inspection;
+  weather_routing::ChartSafetyCache m_chart_safety_cache;
+  std::unique_ptr<ExternalPlanningProvider> m_external_planning_provider;
 
-      WeatherRouting     *m_pWeather_Routing;
-      wxDateTime m_GribTime;
+  wxFileConfig* m_pconfig;
+  wxWindow* m_parent_window;
 
-      int              m_display_width, m_display_height;
-      int              m_leftclick_tool_id;
-      int              m_position_menu_id;
-      int              m_waypoint_menu_id;
-      int              m_route_menu_id;
+  WeatherRouting* m_pWeather_Routing;
+  wxDateTime m_GribTime;
 
-      wxTimer m_tCursorLatLon;
+  int m_display_width, m_display_height;
+  int m_leftclick_tool_id;
+  int m_position_menu_id;
+  int m_waypoint_menu_id;
+  int m_route_menu_id;
+  int m_route_multileg_menu_id;
+
+  wxTimer m_tCursorLatLon;
+  wxTimer m_chart_safety_atlas_timer;
+#ifdef __WXMSW__
+  AddressSpaceMonitor m_addressSpaceMonitor;
+  wxTimer m_addressSpaceTimer;
+#endif
 };
+
+#endif
 
 #endif

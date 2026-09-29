@@ -28,57 +28,57 @@
 
 #include <stdlib.h>
 #include <math.h>
-#include <time.h>
 
 #include <list>
 
 #include "StatisticsDialog.h"
 
-#include "Utilities.h"
-#include "Boat.h"
 #include "RouteMapOverlay.h"
 
-StatisticsDialog::StatisticsDialog(wxWindow *parent)
+StatisticsDialog::StatisticsDialog(wxWindow* parent)
 #ifndef __WXOSX__
     : StatisticsDialogBase(parent)
 #else
-    : StatisticsDialogBase(parent, wxID_ANY, _("Weather Routing Statistics"), wxDefaultPosition, wxDefaultSize, wxDEFAULT_DIALOG_STYLE|wxSTAY_ON_TOP)
+    : StatisticsDialogBase(parent, wxID_ANY, _("Weather Routing Statistics"),
+                           wxDefaultPosition, wxDefaultSize,
+                           wxDEFAULT_DIALOG_STYLE | wxSTAY_ON_TOP)
 #endif
 {
-    SetRouteMapOverlays(std::list<RouteMapOverlay*>());
+  SetRouteMapOverlays(std::list<RouteMapOverlay*>());
 #ifdef __OCPN__ANDROID__
-    wxSize sz = ::wxGetDisplaySize();
-    SetSize(0, 0, sz.x, sz.y-40);
+  wxSize sz = ::wxGetDisplaySize();
+  SetSize(0, 0, sz.x, sz.y - 40);
 #endif
 }
 
-void StatisticsDialog::SetRouteMapOverlays(std::list<RouteMapOverlay*> routemapoverlays)
-{
-    bool running = false;
-    int tisochrons = 0, troutes = 0, tinvroutes = 0, tskippositions = 0, tpositions = 0;
-    for(std::list<RouteMapOverlay *>::iterator it = routemapoverlays.begin();
-        it != routemapoverlays.end(); it++) {
-        if((*it)->Running())
-            running = true;
+void StatisticsDialog::SetRouteMapOverlays(
+    std::list<RouteMapOverlay*> routemapoverlays) {
+  bool running = false;
+  int tisochrons = 0, troutes = 0, tinvroutes = 0, tskippositions = 0,
+      tpositions = 0;
+  for (std::list<RouteMapOverlay*>::iterator it = routemapoverlays.begin();
+       it != routemapoverlays.end(); it++) {
+    if ((*it)->Running()) running = true;
 
-        int isochrons, routes, invroutes, skippositions, positions;
-        (*it)->GetStatistics(isochrons, routes, invroutes, skippositions, positions);
-        tisochrons += isochrons, troutes += routes, tinvroutes += invroutes;
-        tskippositions+= skippositions, tpositions += positions;
-    }
+    int isochrones, routes, invroutes, skippositions, positions;
+    (*it)->GetStatistics(isochrones, routes, invroutes, skippositions,
+                         positions);
+    tisochrons += isochrones, troutes += routes, tinvroutes += invroutes;
+    tskippositions += skippositions, tpositions += positions;
+  }
 
-    m_stState->SetLabel(routemapoverlays.empty() ? _("No Route") :
-                        running ? _("Running") : _("Stopped"));
-    m_stIsoChrons->SetLabel(wxString::Format(_T("%d"), tisochrons));
-    m_stRoutes->SetLabel(wxString::Format(_T("%d"), troutes));
-    m_stInvRoutes->SetLabel(wxString::Format(_T("%d"), tinvroutes));
-    m_stSkipPositions->SetLabel(wxString::Format(_T("%d"), tskippositions));
-    m_stPositions->SetLabel(wxString::Format(_T("%d"), tpositions));
+  m_stState->SetLabel(routemapoverlays.empty() ? _("No Route")
+                      : running                ? _("Running")
+                                               : _("Stopped"));
+  m_stIsoChrons->SetLabel(wxString::Format("%d", tisochrons));
+  m_stRoutes->SetLabel(wxString::Format("%d", troutes));
+  m_stInvRoutes->SetLabel(wxString::Format("%d", tinvroutes));
+  m_stSkipPositions->SetLabel(wxString::Format("%d", tskippositions));
+  m_stPositions->SetLabel(wxString::Format("%d", tpositions));
 
-    Fit();
+  Fit();
 }
 
-void StatisticsDialog::SetRunTime(wxTimeSpan RunTime)
-{
-    m_stRunTime->SetLabel(RunTime.Format());
+void StatisticsDialog::SetRunTime(wxTimeSpan RunTime) {
+  m_stRunTime->SetLabel(RunTime.Format());
 }

@@ -1,9 +1,4 @@
 /***************************************************************************
- *
- * Project:  OpenCPN Weather Routing plugin
- * Author:   Sean D'Epagnier
- *
- ***************************************************************************
  *   Copyright (C) 2015 by Sean D'Epagnier                                 *
  *                                                                         *
  *   This program is free software; you can redistribute it and/or modify  *
@@ -19,30 +14,35 @@
  *   You should have received a copy of the GNU General Public License     *
  *   along with this program; if not, write to the                         *
  *   Free Software Foundation, Inc.,                                       *
- *   51 Franklin Street, Fifth Floor, Boston, MA 02110-1301,  USA.             *
- ***************************************************************************
- */
+ *   51 Franklin Street, Fifth Floor, Boston, MA 02110-1301,  USA.         *
+ **************************************************************************/
+
+#ifndef _WEATHER_ROUTING_REPORT_DIALOG_H_
+#define _WEATHER_ROUTING_REPORT_DIALOG_H_
+
+#include <list>
 
 #include "WeatherRoutingUI.h"
 
 class RouteMapOverlay;
+class WeatherRouting;
 
-class ReportDialog : public ReportDialogBase
-{
+class ReportDialog : public ReportDialogBase {
 public:
-    ReportDialog( WeatherRouting &weatherrouting );
+  ReportDialog(WeatherRouting& weatherrouting);
 
-    void SetRouteMapOverlays(std::list<RouteMapOverlay*> routemapoverlays);
+  void SetRouteMapOverlays(std::list<RouteMapOverlay*> routemapoverlays);
 
-    bool m_bReportStale;
+  bool m_bReportStale;
 
 protected:
-    void GenerateRoutesReport();
-    void OnInformation( wxCommandEvent& event );
-    void OnClose( wxCommandEvent& event ) { Hide(); }
+  void GenerateRoutesReport();
+  void OnInformation(wxCommandEvent& event);
+  void OnClose(wxCommandEvent& event) { Hide(); }
 
 private:
-    wxDateTime DisplayedTime(wxDateTime t);
-    wxString FormatTime(wxDateTime t);
-    WeatherRouting &m_WeatherRouting;
+  wxString FormatTime(wxDateTime t);
+  WeatherRouting& m_WeatherRouting;
 };
+
+#endif
