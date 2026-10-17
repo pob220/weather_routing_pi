@@ -36,22 +36,23 @@ def run(args, cwd, environment):
     return result
 
 
-def main():
+def main(argv=None):
     if sys.platform != 'win32':
         raise SystemExit('Native Windows required')
     parser = argparse.ArgumentParser()
     parser.add_argument('--url', required=True)
     parser.add_argument('--sha256', required=True)
-    args = parser.parse_args()
-    output = Path('windows-import-evidence').resolve()
-    output.mkdir(exist_ok=True)
+    parser.add_argument('--version', default='1.34.0')
+    args = parser.parse_args(argv)
+    output = Path('windows-import-evidence').resolve() / args.version
+    output.mkdir(parents=True, exist_ok=True)
     archive = output / 'candidate.tar.gz'
     download(args.url, archive, args.sha256)
     with tarfile.open(archive) as tar:
         metadata = ET.fromstring(tar.extractfile('metadata.xml').read())
         fields = {key: metadata.findtext(key, '').strip() for key in
                   ['name', 'version', 'api-version', 'target', 'target-version', 'target-arch']}
-        assert fields['version'] == '1.34.0'
+        assert fields['version'] == args.version
         assert fields['target'] == 'msvc-64' and fields['target-arch'] == 'x86_64'
         dlls = [member for member in tar if member.name.endswith('_pi.dll')]
         assert len(dlls) == 1
@@ -110,3 +111,11 @@ def main():
 
 if __name__ == '__main__':
     main()
+    main([
+        '--url', 'https://dl.cloudsmith.io/public/opencpn/celestial-navigation-prod/'
+        'raw/names/celestial_navigation_pi-2.9.10.0-msvc-64-x86-64-10-tarball/'
+        'versions/2.9.10.0+9601.f7ae26d/'
+        'celestial_navigation_pi-2.9.10.0-msvc-64-x86_64-10-MSVC-x64.tar.gz',
+        '--sha256', '3096545dc5f9bbf13f5469f81311def4758af33aa6fde800ba6d476139d4e124',
+        '--version', '2.9.10.0',
+    ])

@@ -31,4 +31,4 @@ jobs:
         if: always()
         with:
           name: genuine-windows-import-evidence
-          path: windows-import-evidence/*.json
+          path: windows-import-evidence/**/import-acceptance.json
