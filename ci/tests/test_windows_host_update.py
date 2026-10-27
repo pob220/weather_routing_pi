@@ -13,16 +13,16 @@ spec.loader.exec_module(host_update)
 
 
 class WindowsHostUpdate(unittest.TestCase):
-    def test_requires_the_merged_fix(self):
-        request = Mock(return_value={'merged': False})
-        with self.assertRaisesRegex(ValueError, 'not merged'):
+    def test_requires_the_accepted_upstream_fix(self):
+        request = Mock(return_value={'status': 'behind'})
+        with self.assertRaisesRegex(ValueError, 'does not contain'):
             host_update.verify_upstream('a' * 40, request)
         self.assertEqual(request.call_count, 1)
+        request.assert_called_once_with('compare/' + host_update.FIX_COMMIT + '...' + 'a' * 40)
 
     def test_requires_a_descendant_of_the_merged_fix(self):
         for status in ('identical', 'ahead', 'behind', 'diverged'):
-            request = Mock(side_effect=[{'merged': True, 'merge_commit_sha': 'b' * 40},
-                                        {'status': status}])
+            request = Mock(return_value={'status': status})
             if status in ('identical', 'ahead'):
                 host_update.verify_upstream('a' * 40, request)
             else:

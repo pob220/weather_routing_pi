@@ -14,6 +14,9 @@ from urllib.request import urlopen
 
 PIN = Path(__file__).with_name('windows64-wx334-sdk.json')
 API = 'https://api.github.com/repos/OpenCPN/OpenCPN/'
+# The maintainer cherry-picked #5499 and closed the PR, so GitHub's `merged`
+# flag is false. Verify ancestry of the actual accepted upstream commit.
+FIX_COMMIT = 'e41f0de5d579310dfd33ad1be36525c3c1a036aa'
 
 
 def github(path):
@@ -24,12 +27,9 @@ def github(path):
 def verify_upstream(revision, request=github):
     if not re.fullmatch(r'[0-9a-f]{40}', revision):
         raise ValueError('Use the full upstream core commit SHA')
-    pull = request('pulls/5499')
-    if not pull.get('merged'):
-        raise ValueError('OpenCPN #5499 is not merged; keep the official host pin unchanged')
-    comparison = request('compare/' + pull['merge_commit_sha'] + '...' + revision)
+    comparison = request('compare/' + FIX_COMMIT + '...' + revision)
     if comparison['status'] not in ('identical', 'ahead'):
-        raise ValueError('The selected core revision does not contain the merged #5499 fix')
+        raise ValueError('The selected core revision does not contain the accepted #5499 fix')
 
 
 def verify_url(url):
