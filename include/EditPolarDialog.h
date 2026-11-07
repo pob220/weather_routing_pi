@@ -1,9 +1,4 @@
 /***************************************************************************
- *
- * Project:  OpenCPN Weather Routing plugin
- * Author:   Sean D'Epagnier
- *
- ***************************************************************************
  *   Copyright (C) 2016 by Sean D'Epagnier                                 *
  *                                                                         *
  *   This program is free software; you can redistribute it and/or modify  *
@@ -19,44 +14,70 @@
  *   You should have received a copy of the GNU General Public License     *
  *   along with this program; if not, write to the                         *
  *   Free Software Foundation, Inc.,                                       *
- *   51 Franklin Street, Fifth Floor, Boston, MA 02110-1301,  USA.             *
- ***************************************************************************
- */
+ *   51 Franklin Street, Fifth Floor, Boston, MA 02110-1301,  USA.         *
+ **************************************************************************/
 
-#ifndef _EDITPOLAR_DIALOG_H_
-#define _EDITPOLAR_DIALOG_H_
+#ifndef _WEATHER_ROUTING_EDITPOLAR_DIALOG_H_
+#define _WEATHER_ROUTING_EDITPOLAR_DIALOG_H_
 
 #include "WeatherRoutingUI.h"
+#include <array>
+#include <vector>
 
 class BoatDialog;
 
 class Polar;
-class EditPolarDialog : public EditPolarDialogBase
-{
+class EditPolarDialog : public EditPolarDialogBase {
 public:
-    EditPolarDialog(wxWindow *parent);
+  EditPolarDialog(wxWindow* parent);
 
-    void SetPolarIndex(int i);
+  void SetPolarIndex(int i);
+#ifdef __OCPN__ANDROID__
+  bool Saved() const { return m_androidSaved; }
+#endif
 
 private:
-    void OnPolarGridChanged( wxGridEvent& event );
-    void OnAddTrueWindAngle( wxCommandEvent& event );
-    void OnRemoveTrueWindAngle( wxCommandEvent& event );
-    void OnAddTrueWindSpeed( wxCommandEvent& event );
-    void OnRemoveTrueWindSpeed( wxCommandEvent& event );
-    void OnAddMeasurement( wxCommandEvent& event );
-    void OnRemoveMeasurement( wxCommandEvent& event );
-    void OnRemoveAllMeasurements( wxCommandEvent& event );
-    void OnGeneratePolar( wxCommandEvent& event );
-    void OnSave( wxCommandEvent& event ) { EndModal(wxID_SAVE); }
+  void OnPolarGridChanged(wxGridEvent& event);
+  void OnAddTrueWindAngle(wxCommandEvent& event);
+  void OnRemoveTrueWindAngle(wxCommandEvent& event);
+  void OnAddTrueWindSpeed(wxCommandEvent& event);
+  void OnRemoveTrueWindSpeed(wxCommandEvent& event);
+  void OnAddMeasurement(wxCommandEvent& event);
+  void OnRemoveMeasurement(wxCommandEvent& event);
+  void OnRemoveAllMeasurements(wxCommandEvent& event);
+  void OnGeneratePolar(wxCommandEvent& event);
+  void OnSave(wxCommandEvent& event) {
+#ifdef __OCPN__ANDROID__
+    if (!ValidateAndroidPolar()) return;
+    m_androidSaved = true;
+#endif
+    EndModal(wxID_SAVE);
+  }
 
-    void RebuildTrueWindAngles();
-    void RebuildTrueWindSpeeds();
-    void RebuildGrid();
-    Polar *GetPolar();
+  void RebuildTrueWindAngles();
+  void RebuildTrueWindSpeeds();
+  void RebuildGrid();
+  Polar* GetPolar();
 
-    int polarindex;
-    BoatDialog *m_BoatDialog;
+#ifdef __OCPN__ANDROID__
+  bool ValidateAndroidSpeeds();
+  bool ValidateAndroidPolar();
+  void RefreshAndroidSpeeds();
+  void RefreshAndroidMeasurements();
+  void ShowAndroidMeasurement();
+  bool m_androidSaved{false};
+  int m_androidDisplayedAngle{-1};
+  wxChoice* m_androidAngle{nullptr};
+  wxChoice* m_androidDimensionAngle{nullptr};
+  wxChoice* m_androidDimensionWind{nullptr};
+  wxScrolledWindow* m_androidSpeeds{nullptr};
+  wxBoxSizer* m_androidSpeedFields{nullptr};
+  wxChoice* m_androidMeasurementPicker{nullptr};
+  wxStaticText* m_androidMeasurementDetails{nullptr};
+  std::vector<std::array<double, 3>> m_androidMeasurements;
+#endif
+  int polarindex{-1};
+  BoatDialog* m_BoatDialog;
 };
 
 #endif

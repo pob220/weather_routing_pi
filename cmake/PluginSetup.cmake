@@ -33,17 +33,17 @@ add_library(${PACKAGE_NAME} SHARED)
 
 project(
   ${PACKAGE}
-  VERSION ${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_PATCH}.${VERSION_TWEAK}
+  VERSION ${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_PATCH}
 )
 message(STATUS "${CMLOC}PROJECT_VERSION: ${PROJECT_VERSION}")
 
 set(PACKAGE_VERSION
-    "${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_PATCH}.${VERSION_TWEAK}"
+    "${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_PATCH}"
 )
 
 message(
   STATUS
-    "${CMLOC}${VERBOSE_NAME} Version: ${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_PATCH}.${VERSION_TWEAK}"
+    "${CMLOC}${VERBOSE_NAME} Version: ${PACKAGE_VERSION}"
 )
 message(STATUS "${CMLOC}OPCN_FLATPAK: ${OCPN_FLATPAK}")
 
@@ -81,17 +81,28 @@ message(
   STATUS
     "${CMLOC}OCPN_FLATPAK_CONFIG: ${OCPN_FLATPAK_CONFIG}, OCPN_FLATPAK_BUILD: ${OCPN_FLATPAK_BUILD}, UNIX: ${UNIX}"
 )
+
+#if (DEFINED ENV{WX_VER})
+#  message(STATUS "${CMLOC}WX_VER defined in circleci config: $ENV{WX_VER}")
+#else ()
+#  message(STATUS "${CMLOC}WX_VER not defined in circleci config")
+#  set(ENV{WX_VER} ${WX_VER})
+#endif ()
+#if (DEFINED ENV{WX_VER_PATCH})
+#  message(STATUS "${CMLOC}WX_VER_PATCH defined in circleci config: $ENV{WX_VER_PATCH}")
+#else()
+#  message(STATUS "${CMLOC}WX_VER_PATCH not defined in circleci config: $ENV{WX_VER_PATCH}")
+#  set(ENV{WX_VER_PATCH} ${WX_VER_PATCH})
+#endif ()
+#message(STATUS "${CMLOC}WX_VER: $ENV{WX_VER}, WX_VER_PATCH: $ENV{WX_VER_PATCH}")
+
 unset(PKG_TARGET_WX_VER)
 if (OCPN_FLATPAK_CONFIG OR OCPN_FLATPAK_BUILD)
   set(PKG_TARGET "flatpak")
   set(PKG_TARGET_VERSION "${SDK_VER}") # As of flatpak/*yaml
   message(STATUS "${CMLOC}PKG_TARGET_VERSION: ${PKG_TARGET_VERSION}")
-  if (NOT "$ENV{WX_VER}" STREQUAL "")
-    set(PKG_TARGET_WX_VER "-$ENV{WX_VER}")
-  else ()
-    unset(PKG_TARGET_WX_VER)
-  endif ()
-  message(STATUS "${CMLOC}PKG_TARGET_WX_VER: ${PKG_TARGET_WX_VER}")
+  # The Flatpak runtime already defines the wx ABI. OpenCPN identifies this
+  # host as flatpak-<arch>, with no wx version in the compatibility label.
 elseif (MINGW)
   set(PKG_TARGET "mingw")
   if (CMAKE_SYSTEM_VERSION)
@@ -100,9 +111,13 @@ elseif (MINGW)
     set(PKG_TARGET_VERSION 10)
   endif ()
 elseif (MSVC)
+  set(PKG_BUILD_TARGET "msvc")
   set(PKG_TARGET "msvc")
+  if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set(PKG_TARGET "msvc-64")
+  endif()
   message(STATUS "${CMLOC}WX_VER: $ENV{WX_VER}")
-  if (NOT "$ENV{WX_VER}" STREQUAL "31")
+  if (NOT "$ENV{WX_VER}" STREQUAL "31" AND NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     # if( NOT "$ENV{WX_VER}" STREQUAL "" )
     set(PKG_TARGET_WX_VER "-wx$ENV{WX_VER}")
   else ()
@@ -176,6 +191,23 @@ else ()
   set(PKG_TARGET_VERSION 1)
 endif ()
 
+string(STRIP "${PKG_TARGET_VERSION}" PKG_TARGET_VERSION)
+# Detect Jammy from the actual build platform, including Docker builds which
+# do not forward BUILD_ENV/WX_VER. OpenCPN distinguishes wx 3.2 on Ubuntu 22.04.
+if (UNIX AND NOT APPLE AND NOT OCPN_FLATPAK_CONFIG
+    AND NOT OCPN_FLATPAK_BUILD AND NOT QT_ANDROID
+    AND PKG_TARGET MATCHES "^[Uu]buntu" AND PKG_TARGET_VERSION STREQUAL "22.04")
+  execute_process(COMMAND wx-config --version
+    OUTPUT_VARIABLE _package_wx_version OUTPUT_STRIP_TRAILING_WHITESPACE
+    RESULT_VARIABLE _package_wx_status)
+  if (NOT _package_wx_status EQUAL 0)
+    message(FATAL_ERROR "Cannot determine the Ubuntu 22.04 wxWidgets ABI")
+  endif ()
+  if (_package_wx_version VERSION_GREATER_EQUAL "3.2")
+    set(PKG_TARGET_WX_VER "-wx32")
+  endif ()
+endif ()
+
 if (${BUILD_GTK3})
   message(STATUS "${CMLOC}set CMAKE defined BUILD_GTK3: ${BUILD_GTK3}")
   set(ENV{BUILD_GTK3} ${BUILD_GTK3})
@@ -200,7 +232,11 @@ if (NOT WIN32 AND NOT QT_ANDROID)
         if (CMAKE_SIZEOF_VOID_P MATCHES "8")
           if ("$ENV{OCPN_TARGET}" MATCHES "flatpak")
             message(STATUS "${CMLOC}*** Flatpak detected  ***")
-            set(ARCH "aarch64")
+            if ("$ENV{BUILD_ARCH}" MATCHES "aarch64")
+              set(ARCH "aarch64")
+            else ("$ENV{BUILD_ARCH}" MATCHES "aarch64")
+              set (ARCH "x86_64")
+            endif ("$ENV{BUILD_ARCH}" MATCHES "aarch64")
           else ("$ENV{OCPN_TARGET}" MATCHES "flatpak")
             set(ARCH "arm64")
           endif ("$ENV{OCPN_TARGET}" MATCHES "flatpak")
@@ -220,8 +256,13 @@ if (NOT WIN32 AND NOT QT_ANDROID)
     if (NOT DEFINED PACKAGE_FORMAT)
       if ("$ENV{OCPN_TARGET}" MATCHES "flatpak")
         message(STATUS "*** Flatpak detected  ***")
+        message(STATUS "** BUILD_ARCH: $ENV{BUILD_ARCH}")
         set(PACKAGE_FORMAT "TGZ")
-        set(ARCH "aarch64")
+        if ("$ENV{BUILD_ARCH}" MATCHES "aarch64")
+          set(ARCH "aarch64")
+        else ("$ENV{BUILD_ARCH}" MATCHES "aarch64")
+          set (ARCH "x86_64")
+        endif ("$ENV{BUILD_ARCH}" MATCHES "aarch64")
         set(LIB_INSTALL_DIR "lib")
       endif ("$ENV{OCPN_TARGET}" MATCHES "flatpak")
     endif (NOT DEFINED PACKAGE_FORMAT)
