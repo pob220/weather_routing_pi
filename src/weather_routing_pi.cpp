@@ -526,7 +526,7 @@ void weather_routing_pi::SetPluginMessage(wxString& message_id,
     const bool changed=api.data!=RouteMap::ClimatologyData ||
         api.wind_atlas!=RouteMap::ClimatologyWindAtlasData ||
         api.cyclones!=RouteMap::ClimatologyCycloneTrackCrossings ||
-        m_climatology_dataset!=wxString::FromUTF8(api.dataset);
+        m_climatology_dataset!=wxString::FromUTF8(api.dataset.c_str());
     if (changed && (!m_pWeather_Routing->m_RunningRouteMaps.empty() ||
         !m_pWeather_Routing->m_WaitingRouteMaps.empty())) {
       m_pWeather_Routing->CancelExternalPlanningScenario();
@@ -539,7 +539,7 @@ void weather_routing_pi::SetPluginMessage(wxString& message_id,
       RouteMap::ClimatologyData = api.data;
       RouteMap::ClimatologyWindAtlasData = api.wind_atlas;
       RouteMap::ClimatologyCycloneTrackCrossings = api.cyclones;
-      m_climatology_dataset=wxString::FromUTF8(api.dataset);
+      m_climatology_dataset=wxString::FromUTF8(api.dataset.c_str());
       if(changed)WeatherDataProvider::ResetClimatologyPreparation();
     }
 
@@ -808,7 +808,7 @@ void weather_routing_pi::NewWR() {
 
   weather_routing::BundledClimatology::Configure(GetPluginDataDir(PLUGIN_PACKAGE_NAME)+"/data/climatology");
   const auto climatology = weather_routing::BundledClimatology::Resolve();
-  m_climatology_dataset=wxString::FromUTF8(climatology.dataset);
+  m_climatology_dataset=wxString::FromUTF8(climatology.dataset.c_str());
   RouteMap::ClimatologyData=climatology.data;
   RouteMap::ClimatologyWindAtlasData=climatology.wind_atlas;
   RouteMap::ClimatologyCycloneTrackCrossings=climatology.cyclones;

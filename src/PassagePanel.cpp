@@ -19,8 +19,6 @@
 #include <wx/notebook.h>
 #include <wx/scrolwin.h>
 #include <wx/menu.h>
-#include <wx/jsonval.h>
-#include <wx/jsonwriter.h>
 #include <wx/textdlg.h>
 #include "RouteWaypointExtractor.h"
 #include <wx/srchctrl.h>
@@ -387,24 +385,11 @@ void PassagePanel::RefreshPassage() {
                        !routing_.m_WaitingRouteMaps.empty() ||
                        routing_.m_RoutePreparationDepth ||
                        routing_.m_DeferredRoutingStartPending;
-  weather_routing::PassageInputs input;
-  input.positionsValid = !c.Start.empty() && !c.End.empty() &&
-                         std::isfinite(c.StartLat) &&
-                         std::isfinite(c.StartLon) && std::isfinite(c.EndLat) &&
-                         std::isfinite(c.EndLon) &&
-                         std::abs(c.StartLat) <= 90 && std::abs(c.EndLat) <= 90;
-  input.distinctPositions = !weather_routing::PositionsCoincide(
-      c.StartLat, c.StartLon, c.EndLat, c.EndLon);
-  const bool arrival =
-      c.TimeMode == RouteMapConfiguration::ROUTE_BY_ARRIVAL_TIME;
-  input.timeValid = arrival ? c.PlannedArrivalTime.IsValid() &&
-                                  c.ArrivalSearchHorizonMinutes > 0
-                            : c.UseCurrentTime || c.StartTime.IsValid();
-  input.coverageChecked = input.positionsValid && input.timeValid;
+  auto input = routing_.InspectPassageInputs(c, boatModel_, climateWindReady_);
+  const bool arrival = c.TimeMode == RouteMapConfiguration::ROUTE_BY_ARRIVAL_TIME;
   wxDateTime departure = c.UseCurrentTime ? wxDateTime::Now() : c.StartTime;
   if (arrival && c.PlannedArrivalTime.IsValid())
-    departure = c.PlannedArrivalTime -
-                wxTimeSpan::Minutes(c.ArrivalSearchHorizonMinutes);
+    departure = c.PlannedArrivalTime - wxTimeSpan::Minutes(c.ArrivalSearchHorizonMinutes);
   wxString when =
       arrival ? _("Target arrival: ") +
                     (c.PlannedArrivalTime.IsValid()
@@ -426,142 +411,9 @@ void PassagePanel::RefreshPassage() {
                  c.MultiLegParentRouteGUID, c.Start, c.End);
     route += _("\nCalculate runs this passage's legs in sequence.");
   }
-  if (c.IsMultiLegGenerated) {
-    std::vector<RouteWaypointInfo> waypoints;
-    wxString error;
-    const auto legs = routing_.GetMultiLegGroupRoutes(c.MultiLegGroupId);
-    input.routeSequenceValid =
-        ExtractOpenCPNRouteWaypoints(c.MultiLegParentRouteGUID, waypoints,
-                                     error) &&
-        waypoints.size() == legs.size() + 1;
-    for (auto* item : legs) {
-      auto leg = item->GetConfiguration();
-      leg.Update();
-      if (!input.savedLegPositionIssue)
-        input.savedLegPositionIssue = weather_routing::CheckRouteLegPositions(
-            {leg.StartGUID, leg.Start, leg.StartLat, leg.StartLon, leg.MultiLegLegIndex},
-            {leg.EndGUID, leg.End, leg.EndLat, leg.EndLon, leg.MultiLegLegIndex + 1},
-            leg.MultiLegLegIndex);
-    }
-    input.routeWaypoints = waypoints;
-    // A saved group may outlive its OpenCPN route. Still check its actual legs.
-    if (input.routeWaypoints.empty()) {
-      for (auto* item : legs) {
-        auto leg = item->GetConfiguration();
-        leg.Update();
-        if (input.routeWaypoints.empty())
-          input.routeWaypoints.push_back({leg.StartGUID, leg.Start,
-              leg.StartLat, leg.StartLon, leg.MultiLegLegIndex});
-        input.routeWaypoints.push_back({leg.EndGUID, leg.End,
-            leg.EndLat, leg.EndLon, leg.MultiLegLegIndex + 1});
-      }
-    }
-    if (input.routeSequenceValid)
-      for (size_t i = 0; i < legs.size(); ++i) {
-        const auto leg = legs[i]->GetConfiguration();
-        if (leg.StartGUID != waypoints[i].guid ||
-            leg.EndGUID != waypoints[i + 1].guid)
-          input.routeSequenceValid = false;
-      }
-  }
-  if (!c.IsMultiLegGenerated && !c.RouteGUID.empty()) {
-    wxString error;
-    ExtractOpenCPNRouteWaypoints(c.RouteGUID, input.routeWaypoints, error);
-  }
-  input.boatError = boatModel_.OpenXML(c.boatFileName, true, false);
-  input.boatValid = input.boatError.empty() && !boatModel_.Polars.empty();
-  input.boatWarnings = boatModel_.loadWarnings;
-  input.exampleBoat =
-      wxFileName(c.boatFileName).GetName() == "Example-40ft-monohull";
-  for (const auto& polar : boatModel_.Polars)
-    input.exampleBoat = input.exampleBoat ||
-                        polar.FileName.Contains("40ft-monohull-example.pol");
   auto& provider = routing_.PassageForecast();
   const bool climate = c.ClimatologyType > RouteMapConfiguration::CURRENTS_ONLY;
-  const int policy = !c.UseGrib ? (climate ? 1 : wxNOT_FOUND) : climate ? 2 : 0;
-  windPolicy_->SetSelection(policy);
-  input.policy =
-      policy == wxNOT_FOUND ? weather_routing::PassageWindPolicy::None
-      : policy == 1         ? weather_routing::PassageWindPolicy::Climatology
-      : policy == 2
-          ? weather_routing::PassageWindPolicy::ForecastWithClimatology
-          : weather_routing::PassageWindPolicy::Forecast;
-  input.forecastLoaded = provider.Loaded();
-  wxDateTime sample = departure;
-  if (arrival && input.forecastLoaded && sample.IsValid() &&
-      c.PlannedArrivalTime.IsValid() &&
-      provider.FirstWindTime() <= c.PlannedArrivalTime.GetTicks() &&
-      provider.FirstWindTime() > sample.GetTicks())
-    sample = wxDateTime(provider.FirstWindTime());
-  if (input.positionsValid && input.timeValid && sample.IsValid()) {
-    const auto time = sample.GetTicks();
-    input.departureWind = provider.HasWind(time, c.StartLat, c.StartLon);
-    input.destinationWind = provider.HasWind(time, c.EndLat, c.EndLon);
-    input.wavesAvailable =
-        c.UseGrib && provider.HasData(Idx_HTSIGW, time, c.StartLat, c.StartLon);
-    input.currentsAvailable =
-        c.UseGrib &&
-        provider.HasData(Idx_SEACURRENT_VX, time, c.StartLat, c.StartLon) &&
-        provider.HasData(Idx_SEACURRENT_VY, time, c.StartLat, c.StartLon);
-    if (!running && c.ClimatologyType != RouteMapConfiguration::DISABLED) {
-      std::lock_guard<std::recursive_mutex> lock(
-          ClimatologyThreadGuard::InvocationMutex());
-      double direction = 0, speed = 0;
-      if (c.ClimatologyType == RouteMapConfiguration::AVERAGE)
-        climateWindReady_ =
-            RouteMap::ClimatologyData &&
-            RouteMap::ClimatologyData(0, sample, c.StartLat, c.StartLon,
-                                      direction, speed);
-      else {
-        int count = 8;
-        double frequencies[8]{}, speeds[8]{}, gale = 0, calm = 0;
-        climateWindReady_ = RouteMap::ClimatologyWindAtlasData &&
-                            RouteMap::ClimatologyWindAtlasData(
-                                sample, c.StartLat, c.StartLon, count,
-                                frequencies, speeds, gale, calm);
-      }
-      if (c.Currents && RouteMap::ClimatologyData)
-        input.currentsAvailable =
-            input.currentsAvailable ||
-            RouteMap::ClimatologyData(1, sample, c.StartLat, c.StartLon,
-                                      direction, speed);
-    }
-    input.climatologyWind = climate && climateWindReady_;
-    double distance = DistGreatCircle_Plugin(c.StartLat, c.StartLon, c.EndLat, c.EndLon);
-    if (input.routeWaypoints.size() >= 2) {
-      distance = 0;
-      for (size_t i = 1; i < input.routeWaypoints.size(); ++i) {
-        const auto& a = input.routeWaypoints[i - 1];
-        const auto& b = input.routeWaypoints[i];
-        distance += DistGreatCircle_Plugin(a.lat, a.lon, b.lat, b.lon);
-      }
-    }
-    input.estimatedFinish =
-        arrival ? c.PlannedArrivalTime
-                : departure + wxTimeSpan::Hours(
-                                  std::max(1, int(std::ceil(distance / 4.0))));
-  }
-  if (provider.Loaded())
-    input.forecastEnd = wxDateTime(provider.LastWindTime());
-  input.useCurrents = c.Currents;
-  input.requireWaves = c.RequireWaveCoverage;
-  input.windLimit = c.MaxTrueWindKnots;
-  input.apparentWindLimit = c.MaxApparentWindKnots;
-  input.waveLimit = c.MaxSwellMeters;
-  input.avoidLand = c.DetectLand;
-  input.avoidBoundaries = c.DetectBoundary;
-  // A passage's other saved legs can have different settings. A missing Draw
-  // provider must be visible even when the selected leg has exclusions off.
-  if (c.IsMultiLegGenerated)
-    for (auto* leg : routing_.GetMultiLegGroupRoutes(c.MultiLegGroupId))
-      input.avoidBoundaries |= leg->GetConfiguration().DetectBoundary;
-  input.boundaryProviderAvailable =
-      RouteMap::ODFindClosestBoundaryLineCrossing != nullptr;
-  input.useMotor = c.UseMotor;
-  input.motorThreshold = c.MotorSpeedThreshold;
-  input.motorSpeed = c.MotorSpeed;
-  input.minimumDepth = c.MinimumDepthMeters;
-  input.chartDepthAvailable = routing_.HasEnhancedChartSafety();
+  windPolicy_->SetSelection(!c.UseGrib ? (climate ? 1 : wxNOT_FOUND) : climate ? 2 : 0);
   readiness_ = weather_routing::EvaluatePassage(input);
   exampleButton_->Show(!input.positionsValid);
   const auto sectionStatus = [&](int section) {
@@ -1504,7 +1356,12 @@ void PassagePanel::ShowLibrary() {
   kind->SetSelection(0);
   kind->SetName(_("Library category"));
   s->Add(kind, 0, wxEXPAND | wxALL, 8);
+#ifdef __OCPN__ANDROID__
+  // The Android wxQt host does not export wxSearchCtrl.
+  auto* search = new wxTextCtrl(&dialog, wxID_ANY);
+#else
   auto* search = new wxSearchCtrl(&dialog, wxID_ANY);
+#endif
   search->SetName(_("Search boat and polar names"));
   s->Add(search, 0, wxEXPAND | wxALL, 8);
   auto* list = new wxListBox(&dialog, wxID_ANY);
@@ -1779,17 +1636,7 @@ void PassagePanel::EditBoatDetails() {
 }
 
 bool PassagePanel::OpenWeather(const wxString& path, wxString& error) {
-  if (!routing_.OpenPassageForecast(path, error)) return false;
-  // An optional viewer receives the same file used by routing. The message
-  // is harmless when no GRIB viewer is enabled; routing remains independent.
-  wxJSONValue request;
-  request["grib_file"] = path;
-  request["show"] = true;
-  wxString body;
-  wxJSONWriter writer;
-  writer.Write(request, body);
-  SendPluginMessage("GRIB_APPLY_JSON_CONFIG", body);
-  return true;
+  return routing_.OpenPassageForecastForUser(path, error);
 }
 
 void PassagePanel::LoadWeather() {

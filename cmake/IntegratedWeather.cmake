@@ -43,6 +43,20 @@ if(NOT OCPN_FLATPAK_CONFIG)
     # Installed above from the independently built and tested helper stage.
   elseif(ANDROID)
     target_link_libraries(${PACKAGE_NAME} PRIVATE environmental_grib_engine)
+    # The host carries an older TLS stack. Keep the complete statically linked
+    # generator runtime private, as in the tested Android xGRIB adapter.
+    target_link_options(${PACKAGE_NAME} PRIVATE "-Wl,--exclude-libs,ALL")
+    install(FILES third_party/environmental-grib-generator/LICENSE
+      third_party/INTEGRATED_WEATHER_SOURCES.md DESTINATION
+      "${PREFIX_PARENTDATA}/plugins/${PACKAGE_NAME}/data/android-licenses")
+    file(GLOB _android_dependency_licenses
+      "${_VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/share/*/copyright")
+    foreach(_license IN LISTS _android_dependency_licenses)
+      get_filename_component(_dependency_dir "${_license}" DIRECTORY)
+      get_filename_component(_dependency "${_dependency_dir}" NAME)
+      install(FILES "${_license}" DESTINATION
+        "${PREFIX_PARENTDATA}/plugins/${PACKAGE_NAME}/data/android-licenses/${_dependency}")
+    endforeach()
   elseif(UNIX AND NOT APPLE)
     set_target_properties(environmental-grib PROPERTIES OUTPUT_NAME environmental-grib.bin)
     install(TARGETS environmental-grib RUNTIME DESTINATION

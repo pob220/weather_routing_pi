@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "PlanningHelp.h"
+#include "WeatherRoutingWxCompat.h"
 #include <wx/dialog.h>
 #include <wx/display.h>
 #include <wx/stattext.h>
@@ -178,14 +179,14 @@ void KeepPlanningDialogVisible(wxWindow* window) {
     areas.push_back(wxDisplay(i).GetClientArea());
   if (areas.empty()) areas.push_back(wxGetClientDisplayRect());
   window->SetSize(VisiblePlanningDialog(
-      window->GetRect(), window->FromDIP(wxSize(600, 400)), areas));
+      window->GetRect(), WR_FromDIP(window, wxSize(600, 400)), areas));
 }
 void ShowPlanningHelp(wxWindow* parent, PlanningHelpTopic topic) {
   auto* dialog =
       wxDynamicCast(parent->FindWindow("PlanningContextHelp"), wxDialog);
   if (!dialog) {
     dialog = new wxDialog(parent, wxID_ANY, wxEmptyString, wxDefaultPosition,
-                          parent->FromDIP(wxSize(580, 440)),
+                          WR_FromDIP(parent, wxSize(580, 440)),
                           wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER);
     dialog->SetName("PlanningContextHelp");
     auto* sizer = new wxBoxSizer(wxVERTICAL);

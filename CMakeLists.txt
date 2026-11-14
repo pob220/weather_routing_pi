@@ -89,11 +89,11 @@ set(PACKAGE_CONTACT "Sean d'Epagnier; Weather Routing Plugin Team")
 set(SHORT_DESCRIPTION
     "Integrated passage planning: route, boat, polars and weather.")
 set(LONG_DESCRIPTION
-    "xWeatherRouting 2.2.4 adds optional automatic adaptive routing settings and brings route setup, a searchable polar library, boat and polar editing, GRIB loading and xGRIB weather generation into one passage-planning workflow. Includes an illustrative 40 ft monohull and the complete Climatology 2026.2 dataset. A compatible installed Climatology provider with newer data takes precedence. The existing routing engines, reports, OpenCPN route analysis, multi-leg passages and optional chart-aware safety remain available. Ordinary routing and GSHHG land avoidance work on stock OpenCPN; chart-backed checks require a compatible enhanced host. Uses separate version 2 preferences and user data. Version 1 remains the stable catalogue line while this separate development branch is qualified.")
+    "${COMMON_NAME} 2.2.6 adds optional automatic adaptive routing settings and brings route setup, a searchable polar library, boat and polar editing, independent GRIB loading and generation, with optional xGRIB chart display into one passage-planning workflow. Includes an illustrative 40 ft monohull and the complete Climatology 2026.2 dataset. A compatible installed Climatology provider with newer data takes precedence. The existing routing engines, reports, OpenCPN route analysis, multi-leg passages and optional chart-aware safety remain available. Ordinary routing and GSHHG land avoidance work on stock OpenCPN; chart-backed checks require a compatible enhanced host. Uses separate version 2 preferences and user data. Version 1 remains the stable catalogue line while this separate development branch is qualified.")
 
 set(VERSION_MAJOR "2")
 set(VERSION_MINOR "2")
-set(VERSION_PATCH "5")
+set(VERSION_PATCH "6")
 set(VERSION_TWEAK "0")
 # Keep all five approved source archives for verification and regression tests.
 # Packages ship only Crude, Low and Intermediate; High and Full are optional
@@ -364,7 +364,8 @@ SET(SRCS
 )
 
 if(QT_ANDROID)
-  list(APPEND SRCS src/AndroidWeatherRouting.cpp)
+  list(APPEND SRCS src/AndroidWeatherRouting.cpp
+    src/android/PassageWeatherGenerator.cpp)
 endif()
 
 SET (HDRS
@@ -556,8 +557,16 @@ if (NOT OCPN_FLATPAK_CONFIG)
   add_subdirectory(opencpn-libs/odapi)
   target_link_libraries(${PACKAGE_NAME} PRIVATE ocpn::odapi)
 
-  add_subdirectory(opencpn-libs/jsonlib)
-  target_link_libraries(${PACKAGE_NAME} PRIVATE ocpn::jsonlib)
+  if(QT_ANDROID)
+    # The in-process generator and host adapter must use one JSON ABI.
+    # Mixing the legacy bundled headers/runtime with modern jsoncpp corrupts
+    # values and also introduces duplicate symbols when the worker is linked.
+    find_package(jsoncpp CONFIG REQUIRED)
+    target_link_libraries(${PACKAGE_NAME} PRIVATE JsonCpp::JsonCpp)
+  else()
+    add_subdirectory(opencpn-libs/jsonlib)
+    target_link_libraries(${PACKAGE_NAME} PRIVATE ocpn::jsonlib)
+  endif()
 
   add_subdirectory(opencpn-libs/plugin_dc)
   if(TARGET _DC_UTILS AND TARGET wx::core)

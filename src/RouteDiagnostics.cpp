@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "RouteDiagnostics.h"
+#ifdef __OCPN__ANDROID__
+#include "TimeZoneDisplay.h"
+#endif
 #include "supercpn/weather_routing/Engine.h"
 
 #include <algorithm>
@@ -193,8 +196,14 @@ void Usage(RouteDiagnosticReport& report, const wr::RoutingResult& result,
 }  // namespace
 
 wxString DiagnosticTimeUtc(wr::TimePoint time) {
+#ifdef __OCPN__ANDROID__
+  return marine_time::FormatInTimeZone(
+      wxDateTime(static_cast<time_t>(time.time_since_epoch().count())),
+      "%Y-%m-%d %H:%M:%S", "UTC", false);
+#else
   return wxDateTime(static_cast<time_t>(time.time_since_epoch().count()))
       .Format("%Y-%m-%d %H:%M:%S", wxDateTime::UTC);
+#endif
 }
 wxString DiagnosticSeverityTitle(DiagnosticSeverity severity) {
   switch (severity) {

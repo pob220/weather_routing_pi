@@ -48,6 +48,7 @@
 #include <wx/tokenzr.h>
 #include "ChartSafetyDefaults.h"
 #include "PassageSettings.h"
+#include "PassageWeather.h"
 #include "BoatDialog.h"
 #include "weather_routing_pi.h"
 #include "WeatherRouting.h"
@@ -731,7 +732,13 @@ void ConfigurationDialog::EditBoat() {
   m_WeatherRouting.m_BoatDialog.Show();
 }
 void ConfigurationDialog::OnGribTime(wxCommandEvent& event) {
-  SetStartDateTime(m_GribTimelineTime);
+  wxDateTime selected = m_GribTimelineTime;
+  auto& forecast = m_WeatherRouting.PassageForecast();
+  if (forecast.Loaded() &&
+      (!selected.IsValid() || selected.GetTicks() < forecast.FirstWindTime() ||
+       selected.GetTicks() > forecast.LastWindTime()))
+    selected = wxDateTime(forecast.FirstWindTime());
+  SetStartDateTime(selected);
   Update();
 }
 
@@ -1861,8 +1868,8 @@ void ConfigurationDialog::SetStartDateTime(wxDateTime datetime) {
     m_edited_controls.push_back(m_tpTime);
     m_edited_controls.push_back(m_dpStartDate);
   } else {
-    WR_MessageDialog mdlg(this, _("Invalid Date Time."),
-                         wxString(_("Weather Routing"), wxOK | wxICON_WARNING));
+    WR_MessageDialog mdlg(this, _("No valid GRIB time is available. Load a forecast or set the date and time."),
+                         _("Weather Routing"), wxOK | wxICON_WARNING);
     mdlg.ShowModal();
   }
 }

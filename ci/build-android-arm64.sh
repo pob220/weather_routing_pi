@@ -44,6 +44,14 @@ if [[ -z "${NDK_HOME:-}" ]]; then
 fi
 test -x "$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang++"
 export NDK_HOME OCPN_TARGET=android-arm64
+export ANDROID_NDK_HOME="$NDK_HOME"
+generator_deps=${ANDROID_GENERATOR_PREFIX:-"$work_dir/generator-deps/installed/arm64-android-release"}
+generator_vcpkg=${ANDROID_GENERATOR_VCPKG:-"$work_dir/generator-deps/vcpkg"}
+if [[ ! -f "$generator_deps/share/eccodes/eccodes-config.cmake" ||
+      ! -f "$generator_deps/share/netcdf-c/netCDFConfig.cmake" ]]; then
+  ANDROID_GENERATOR_WORKDIR="$work_dir/generator-deps" \
+    bash "$source_dir/ci/build-android-generator-deps.sh"
+fi
 tool_base="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64"
 
 if [[ ! -d "$core_source/.git" ]]; then
@@ -133,7 +141,14 @@ git -C "$source_dir" submodule update --init opencpn-libs
 
 cmake -S "$source_dir" -B "$plugin_build" \
   -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
-  -DCMAKE_TOOLCHAIN_FILE="$source_dir/cmake/android-aarch64-toolchain.cmake" \
+  -DCMAKE_TOOLCHAIN_FILE="$generator_vcpkg/scripts/buildsystems/vcpkg.cmake" \
+  -DVCPKG_CHAINLOAD_TOOLCHAIN_FILE="$source_dir/cmake/android-aarch64-toolchain.cmake" \
+  -DVCPKG_INSTALLED_DIR="$(dirname "$generator_deps")" \
+  -DVCPKG_MANIFEST_MODE=OFF \
+  -DVCPKG_TARGET_TRIPLET=arm64-android-release \
+  -DCMAKE_PREFIX_PATH="$generator_deps" \
+  -DCMAKE_FIND_ROOT_PATH="$generator_deps" \
+  -DBUILD_TESTING=OFF \
   -D_wx_selected_config=androideabi-qt-arm64 \
   -DOCPN_Android_Common="$support_root" \
   -DOCPN_ANDROID_CORE_LIBRARY="$core_build/libgorp.so" \
@@ -144,6 +159,8 @@ cmake -S "$source_dir" -B "$plugin_build" \
 cmake --build "$plugin_build" \
   --parallel "${CMAKE_BUILD_PARALLEL_LEVEL:-3}" \
   2>&1 | tee "$artifacts/build-plugin.log"
+python3 "$source_dir/ci/verify-android-runtime.py" \
+  "$tool_base/bin/llvm-readelf" "$plugin_build/lib${package_name}.so"
 rm -f "$plugin_build"/"$package_name"-*-android-arm64.tar.gz \
       "$plugin_build"/"$package_name"-*-android-arm64.xml \
       "$artifacts/package"/"$package_name"-* "$artifacts/package/SHA256SUMS"

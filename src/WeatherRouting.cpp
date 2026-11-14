@@ -45,6 +45,8 @@
 #include <wx/spinctrl.h>
 
 #include <json/json.h>
+#include <wx/jsonval.h>
+#include <wx/jsonwriter.h>
 
 #include <stdlib.h>
 #include <math.h>
@@ -94,6 +96,9 @@
 #include "headless/HeadlessRouteMonitor.h"
 #include "georef.h"
 #include "PassagePanel.h"
+#ifdef __OCPN__ANDROID__
+#include "android/PassageWeatherGenerator.h"
+#endif
 #include "PassageReadiness.h"
 #include "PassageWeather.h"
 #include "BundledClimatology.h"
@@ -1668,7 +1673,6 @@ WeatherRouting::WeatherRouting(wxWindow* parent, weather_routing_pi& plugin)
       wxEVT_COMMAND_BUTTON_CLICKED,
       wxCommandEventHandler(WeatherRouting::OnExportRouteAsGPX), NULL, this);
 
-#ifndef __OCPN__ANDROID__
   wxString previousForecast;
   pConf->SetPath("/PlugIns/xWeatherRouting2");
   pConf->Read("PassageGribFile",&previousForecast);
@@ -1693,6 +1697,9 @@ WeatherRouting::WeatherRouting(wxWindow* parent, weather_routing_pi& plugin)
     wxString error;
     m_PassageWeather->Open(previousForecast,error);
   }
+  if (m_PassageWeather->Loaded())
+    m_ConfigurationDialog.m_GribTimelineTime = wxDateTime(m_PassageWeather->FirstWindTime());
+#ifndef __OCPN__ANDROID__
   auto* notebook = new wxAuiNotebook(this, wxID_ANY, wxDefaultPosition,
       wxDefaultSize, wxAUI_NB_TOP | wxAUI_NB_SCROLL_BUTTONS);
   m_PassageNotebook=notebook;
@@ -1704,7 +1711,8 @@ WeatherRouting::WeatherRouting(wxWindow* parent, weather_routing_pi& plugin)
   m_PassagePanel = new PassagePanel(notebook, *this);
   notebook->InsertPage(0, m_PassagePanel, _("Plan passage"), true);
   bSizer->Add(notebook, 1, wxEXPAND);
-  SetTitle(_("xWeatherRouting 2.2.0"));
+  SetTitle(wxString::Format("%s %d.%d.%d", wxString::FromUTF8(PLUGIN_COMMON_NAME),
+      PLUGIN_VERSION_MAJOR, PLUGIN_VERSION_MINOR, PLUGIN_VERSION_PATCH));
   SetMinSize(FromDIP(wxSize(640, 480)));
   pConf->SetPath("/PlugIns/xWeatherRouting2");
   if (!pConf->HasEntry("DialogWidth") || !pConf->HasEntry("DialogHeight")) {
@@ -1736,6 +1744,7 @@ WeatherRouting::~WeatherRouting() {
   // Stop the planning timer and child generator before route ownership ends.
   if (m_PassagePanel) m_PassagePanel->PrepareForShutdown();
 #ifdef __OCPN__ANDROID__
+  m_androidGenerator.reset();
   delete m_androidChartPickHint;
   m_androidLayoutTimer.Stop();
   m_androidLayoutTimer.Disconnect(
@@ -1911,6 +1920,184 @@ bool WeatherRouting::OpenPassageForecast(const wxString& path, wxString& error) 
   config->SetPath("/PlugIns/xWeatherRouting2");config->Write("PassageGribFile",path);
   return true;
 }
+bool WeatherRouting::OpenPassageForecastForUser(const wxString& path,
+                                               wxString& error) {
+  if (!OpenPassageForecast(path, error)) return false;
+  RequestPassageWeatherDisplay(path);
+  return true;
+}
+
+void WeatherRouting::RequestPassageWeatherDisplay(const wxString& path) {
+  // Both frontends load their own forecast first. Chart display is optional.
+  wxJSONValue request;
+  request["grib_file"] = path;
+  request["show"] = true;
+  wxString body;
+  wxJSONWriter writer;
+  writer.Write(request, body);
+  SendPluginMessage("GRIB_APPLY_JSON_CONFIG", body);
+}
+
+weather_routing::PassageInputs WeatherRouting::InspectPassageInputs(
+    const RouteMapConfiguration& c, Boat& boatModel, bool& climateWindReady) {
+  const bool running = !m_RunningRouteMaps.empty() || !m_WaitingRouteMaps.empty() ||
+      m_RoutePreparationDepth || m_DeferredRoutingStartPending;
+  weather_routing::PassageInputs input;
+  input.positionsValid = !c.Start.empty() && !c.End.empty() &&
+                         std::isfinite(c.StartLat) &&
+                         std::isfinite(c.StartLon) && std::isfinite(c.EndLat) &&
+                         std::isfinite(c.EndLon) &&
+                         std::abs(c.StartLat) <= 90 && std::abs(c.EndLat) <= 90;
+  input.distinctPositions = !weather_routing::PositionsCoincide(
+      c.StartLat, c.StartLon, c.EndLat, c.EndLon);
+  const bool arrival =
+      c.TimeMode == RouteMapConfiguration::ROUTE_BY_ARRIVAL_TIME;
+  input.timeValid = arrival ? c.PlannedArrivalTime.IsValid() &&
+                                  c.ArrivalSearchHorizonMinutes > 0
+                            : c.UseCurrentTime || c.StartTime.IsValid();
+  input.coverageChecked = input.positionsValid && input.timeValid;
+  wxDateTime departure = c.UseCurrentTime ? wxDateTime::Now() : c.StartTime;
+  if (arrival && c.PlannedArrivalTime.IsValid())
+    departure = c.PlannedArrivalTime -
+                wxTimeSpan::Minutes(c.ArrivalSearchHorizonMinutes);
+  if (c.IsMultiLegGenerated) {
+    std::vector<RouteWaypointInfo> waypoints;
+    wxString error;
+    const auto legs = GetMultiLegGroupRoutes(c.MultiLegGroupId);
+    input.routeSequenceValid =
+        ExtractOpenCPNRouteWaypoints(c.MultiLegParentRouteGUID, waypoints,
+                                     error) &&
+        waypoints.size() == legs.size() + 1;
+    for (auto* item : legs) {
+      auto leg = item->GetConfiguration();
+      leg.Update();
+      if (!input.savedLegPositionIssue)
+        input.savedLegPositionIssue = weather_routing::CheckRouteLegPositions(
+            {leg.StartGUID, leg.Start, leg.StartLat, leg.StartLon, leg.MultiLegLegIndex},
+            {leg.EndGUID, leg.End, leg.EndLat, leg.EndLon, leg.MultiLegLegIndex + 1},
+            leg.MultiLegLegIndex);
+    }
+    input.routeWaypoints = waypoints;
+    // A saved group may outlive its OpenCPN route. Still check its actual legs.
+    if (input.routeWaypoints.empty()) {
+      for (auto* item : legs) {
+        auto leg = item->GetConfiguration();
+        leg.Update();
+        if (input.routeWaypoints.empty())
+          input.routeWaypoints.push_back({leg.StartGUID, leg.Start,
+              leg.StartLat, leg.StartLon, leg.MultiLegLegIndex});
+        input.routeWaypoints.push_back({leg.EndGUID, leg.End,
+            leg.EndLat, leg.EndLon, leg.MultiLegLegIndex + 1});
+      }
+    }
+    if (input.routeSequenceValid)
+      for (size_t i = 0; i < legs.size(); ++i) {
+        const auto leg = legs[i]->GetConfiguration();
+        if (leg.StartGUID != waypoints[i].guid ||
+            leg.EndGUID != waypoints[i + 1].guid)
+          input.routeSequenceValid = false;
+      }
+  }
+  if (!c.IsMultiLegGenerated && !c.RouteGUID.empty()) {
+    wxString error;
+    ExtractOpenCPNRouteWaypoints(c.RouteGUID, input.routeWaypoints, error);
+  }
+  input.boatError = boatModel.OpenXML(c.boatFileName, true, false);
+  input.boatValid = input.boatError.empty() && !boatModel.Polars.empty();
+  input.boatWarnings = boatModel.loadWarnings;
+  input.exampleBoat =
+      wxFileName(c.boatFileName).GetName() == "Example-40ft-monohull";
+  for (const auto& polar : boatModel.Polars)
+    input.exampleBoat = input.exampleBoat ||
+                        polar.FileName.Contains("40ft-monohull-example.pol");
+  auto& provider = PassageForecast();
+  const bool climate = c.ClimatologyType > RouteMapConfiguration::CURRENTS_ONLY;
+  const int policy = !c.UseGrib ? (climate ? 1 : wxNOT_FOUND) : climate ? 2 : 0;
+  input.policy =
+      policy == wxNOT_FOUND ? weather_routing::PassageWindPolicy::None
+      : policy == 1         ? weather_routing::PassageWindPolicy::Climatology
+      : policy == 2
+          ? weather_routing::PassageWindPolicy::ForecastWithClimatology
+          : weather_routing::PassageWindPolicy::Forecast;
+  input.forecastLoaded = provider.Loaded();
+  wxDateTime sample = departure;
+  if (arrival && input.forecastLoaded && sample.IsValid() &&
+      c.PlannedArrivalTime.IsValid() &&
+      provider.FirstWindTime() <= c.PlannedArrivalTime.GetTicks() &&
+      provider.FirstWindTime() > sample.GetTicks())
+    sample = wxDateTime(provider.FirstWindTime());
+  if (input.positionsValid && input.timeValid && sample.IsValid()) {
+    const auto time = sample.GetTicks();
+    input.departureWind = provider.HasWind(time, c.StartLat, c.StartLon);
+    input.destinationWind = provider.HasWind(time, c.EndLat, c.EndLon);
+    input.wavesAvailable =
+        c.UseGrib && provider.HasData(Idx_HTSIGW, time, c.StartLat, c.StartLon);
+    input.currentsAvailable =
+        c.UseGrib &&
+        provider.HasData(Idx_SEACURRENT_VX, time, c.StartLat, c.StartLon) &&
+        provider.HasData(Idx_SEACURRENT_VY, time, c.StartLat, c.StartLon);
+    if (!running && c.ClimatologyType != RouteMapConfiguration::DISABLED) {
+      std::lock_guard<std::recursive_mutex> lock(
+          ClimatologyThreadGuard::InvocationMutex());
+      double direction = 0, speed = 0;
+      if (c.ClimatologyType == RouteMapConfiguration::AVERAGE)
+        climateWindReady =
+            RouteMap::ClimatologyData &&
+            RouteMap::ClimatologyData(0, sample, c.StartLat, c.StartLon,
+                                      direction, speed);
+      else {
+        int count = 8;
+        double frequencies[8]{}, speeds[8]{}, gale = 0, calm = 0;
+        climateWindReady = RouteMap::ClimatologyWindAtlasData &&
+                            RouteMap::ClimatologyWindAtlasData(
+                                sample, c.StartLat, c.StartLon, count,
+                                frequencies, speeds, gale, calm);
+      }
+      if (c.Currents && RouteMap::ClimatologyData)
+        input.currentsAvailable =
+            input.currentsAvailable ||
+            RouteMap::ClimatologyData(1, sample, c.StartLat, c.StartLon,
+                                      direction, speed);
+    }
+    input.climatologyWind = climate && climateWindReady;
+    double distance = DistGreatCircle_Plugin(c.StartLat, c.StartLon, c.EndLat, c.EndLon);
+    if (input.routeWaypoints.size() >= 2) {
+      distance = 0;
+      for (size_t i = 1; i < input.routeWaypoints.size(); ++i) {
+        const auto& a = input.routeWaypoints[i - 1];
+        const auto& b = input.routeWaypoints[i];
+        distance += DistGreatCircle_Plugin(a.lat, a.lon, b.lat, b.lon);
+      }
+    }
+    input.estimatedFinish =
+        arrival ? c.PlannedArrivalTime
+                : departure + wxTimeSpan::Hours(
+                                  std::max(1, int(std::ceil(distance / 4.0))));
+  }
+  if (provider.Loaded())
+    input.forecastEnd = wxDateTime(provider.LastWindTime());
+  input.useCurrents = c.Currents;
+  input.requireWaves = c.RequireWaveCoverage;
+  input.windLimit = c.MaxTrueWindKnots;
+  input.apparentWindLimit = c.MaxApparentWindKnots;
+  input.waveLimit = c.MaxSwellMeters;
+  input.avoidLand = c.DetectLand;
+  input.avoidBoundaries = c.DetectBoundary;
+  // A passage's other saved legs can have different settings. A missing Draw
+  // provider must be visible even when the selected leg has exclusions off.
+  if (c.IsMultiLegGenerated)
+    for (auto* leg : GetMultiLegGroupRoutes(c.MultiLegGroupId))
+      input.avoidBoundaries |= leg->GetConfiguration().DetectBoundary;
+  input.boundaryProviderAvailable =
+      RouteMap::ODFindClosestBoundaryLineCrossing != nullptr;
+  input.useMotor = c.UseMotor;
+  input.motorThreshold = c.MotorSpeedThreshold;
+  input.motorSpeed = c.MotorSpeed;
+  input.minimumDepth = c.MinimumDepthMeters;
+  input.chartDepthAvailable = HasEnhancedChartSafety();
+  return input;
+}
+
 void WeatherRouting::ApplyPassageConfiguration(const RouteMapConfiguration& configuration) {
   auto* selected=FirstCurrentRouteMap();if(!selected || RouteComputationActive(selected))return;
   const auto previous=selected->GetConfiguration();
@@ -2923,6 +3110,15 @@ void WeatherRouting::ShowRoutingProgress(const wxString& title, bool newRun) {
     m_RoutingProgressDetail->SetMinSize(wxSize(0, 300));
     m_RoutingProgressDetail->GetHandle()->setStyleSheet(
         "QTextEdit { font-size: 17pt; padding: 8px; }");
+    pages->GetHandle()->setStyleSheet(
+        "QTabBar::tab { font-size: 16pt; min-height: 64px; min-width: 150px; }");
+    m_RoutingProgressHistory->GetHandle()->setStyleSheet(
+        "QTextEdit { font-size: 16pt; padding: 8px; }");
+    for (auto* button : {copy, save}) {
+      button->SetMinSize(wxSize(220, 72));
+      WR_EnableAndroidButton(button);
+      button->GetHandle()->setStyleSheet("QPushButton { font-size: 17pt; }");
+    }
     note->GetHandle()->setStyleSheet("QLabel { font-size: 16pt; }");
     const int width = GetCanvasByIndex(0)->GetClientSize().x * 9 / 10;
     note->Wrap(width - 40);
@@ -3123,6 +3319,7 @@ void WeatherRouting::RefreshRoutingProgressTiming() {
 #ifdef __OCPN__ANDROID__
   WR_WrapAndroidText(m_RoutingProgressTiming, timing,
                     m_RoutingProgressDialog->GetClientSize().x - 40);
+  m_RoutingProgressTiming->GetParent()->Layout();
 #else
   m_RoutingProgressTiming->Wrap(540);
 #endif
@@ -12983,7 +13180,7 @@ void WeatherRouting::Start(RouteMapOverlay* routemapoverlay) {
   setupDiagnostics.context += "\n" + wxString(wxVERSION_STRING);
   if (m_PassageWeather->Loaded())
     setupDiagnostics.context += "\n"+m_PassageWeather->Summary()+"\n"+m_PassageWeather->Details()+
-        "\n"+wxString::FromUTF8(m_PassageWeather->Identity());
+        "\n"+wxString::FromUTF8(m_PassageWeather->Identity().c_str());
   setupDiagnostics.context += "\n" + weather_routing::BundledClimatology::Source();
   bool illustrativeBoat=configuration.boatFileName.Contains("Example-40ft-monohull");
   TiXmlDocument boatMetadata;

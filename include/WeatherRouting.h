@@ -63,8 +63,11 @@ class wxScrolledWindow;
 class weather_routing_pi;
 class WeatherRouting;
 class PassagePanel;
+#ifdef __OCPN__ANDROID__
+class AndroidPassageWeatherDialog;
+#endif
 class wxAuiNotebook;
-namespace weather_routing { class PassageWeather; }
+namespace weather_routing { class PassageWeather; struct PassageInputs; }
 
 /**
  * Class representing a weather routing configuration and its associated route.
@@ -232,6 +235,7 @@ private:
   std::shared_ptr<weather_routing::PassageWeather> m_PassageWeather;
   PassagePanel* m_PassagePanel{nullptr};
   wxAuiNotebook* m_PassageNotebook{nullptr};
+  void RequestPassageWeatherDisplay(const wxString& path);
 
   bool m_disable_colpane;
   wxCollapsiblePane* m_colpane;
@@ -286,6 +290,10 @@ public:
   ~WeatherRouting();
   weather_routing::PassageWeather& PassageForecast();
   bool OpenPassageForecast(const wxString& path, wxString& error);
+  bool OpenPassageForecastForUser(const wxString& path, wxString& error);
+  weather_routing::PassageInputs InspectPassageInputs(
+      const RouteMapConfiguration& configuration, Boat& boatModel,
+      bool& climateWindReady);
   void ApplyPassageConfiguration(const RouteMapConfiguration& configuration);
   void DisablePassageDrawExclusions();
   void RememberWeatherSourceChoice(const RouteMapConfiguration& configuration);
@@ -1020,7 +1028,25 @@ public:
   void CancelAndroidChartPick();
   bool HandleAndroidChartPick(wxMouseEvent& event, PlugIn_ViewPort* viewport);
 private:
-  bool EditAndroidPosition(wxString& name, double& latitude, double& longitude);
+  bool EditAndroidPosition(wxString& name, double& latitude, double& longitude,
+                           bool waypoint = false);
+  void LoadAndroidPassageWeather();
+  void GenerateAndroidPassageWeather();
+  void RefreshAndroidPassageWeather();
+  void RefreshAndroidReadiness(RouteMapOverlay* route);
+  void ReviewAndroidReadiness();
+  void EditAndroidRouteWaypoint();
+  std::vector<wxButton*> m_androidComputeSelected;
+  std::unique_ptr<Boat> m_androidReadinessBoat;
+  bool m_androidClimateReady{false};
+  wxStaticText* m_androidReadinessStatus{nullptr};
+  wxButton* m_androidReadinessAction{nullptr};
+  weather_routing::RouteDiagnosticReport m_androidReadinessReport;
+  std::string m_androidReadinessCode;
+  std::unique_ptr<AndroidPassageWeatherDialog> m_androidGenerator;
+  wxString m_androidGeneratedForecast;
+  wxStaticText* m_androidForecastStatus{nullptr};
+  std::vector<wxButton*> m_androidForecastActions;
   int m_androidChartPickTarget{-2};
   wxDialog* m_androidChartPickHint{nullptr};
   wxPoint m_androidChartPickDown;

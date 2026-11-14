@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "PassageWeather.h"
 #include "ShorelineDataset.h"
+#ifdef __OCPN__ANDROID__
+#include "TimeZoneDisplay.h"
+#endif
 #include <algorithm>
 #include <cmath>
 #include <wx/datetime.h>
@@ -50,7 +53,11 @@ int Index(const GribRecord& r) {
   }
 }
 wxString UTC(time_t t) {
+#ifdef __OCPN__ANDROID__
+  return marine_time::FormatInTimeZone(wxDateTime(t), "%d %b %Y, %H:%M", "UTC");
+#else
   return wxDateTime(t).Format("%d %b %Y, %H:%M", wxDateTime::UTC) + " UTC";
+#endif
 }
 }  // namespace
 

@@ -349,7 +349,7 @@ ClimatologyMessage BundledClimatology::Resolve(
   if (external.valid && external.supported && external.data &&
       external.wind_atlas &&
       Dataset(external.dataset) > std::make_pair(2026, 2)) {
-    source = "Installed Climatology: " + wxString::FromUTF8(external.dataset);
+    source = "Installed Climatology: " + wxString::FromUTF8(external.dataset.c_str());
     return external;
   }
   source = "Bundled Climatology 2026.2";

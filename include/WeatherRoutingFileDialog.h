@@ -14,7 +14,70 @@
 #include <QStandardPaths>
 #include <QAbstractItemView>
 #include <QScreen>
+#include <QScrollBar>
 #include "ocpn_plugin.h"
+
+// Consume a drag before QListWidget turns its release into itemClicked.
+// This host can deliver synthesized mouse input instead of QScroller touch
+// events. Handle both paths and activate only a stationary tap.
+class WR_PickerDragFilter : public QObject {
+ public:
+  explicit WR_PickerDragFilter(QListWidget* list) : QObject(list), list_(list) {
+    list_->viewport()->setAttribute(Qt::WA_AcceptTouchEvents);
+    list_->viewport()->installEventFilter(this);
+  }
+ protected:
+  bool eventFilter(QObject*, QEvent* event) override {
+    const bool touch = event->type() == QEvent::TouchBegin ||
+        event->type() == QEvent::TouchUpdate || event->type() == QEvent::TouchEnd ||
+        event->type() == QEvent::TouchCancel;
+    const bool mouse = event->type() == QEvent::MouseButtonPress ||
+        event->type() == QEvent::MouseMove || event->type() == QEvent::MouseButtonRelease;
+    if (!touch && !mouse) return false;
+    QPoint point;
+    bool begin = false, end = false;
+    const bool cancel = event->type() == QEvent::TouchCancel;
+    if (touch) {
+      auto* input = static_cast<QTouchEvent*>(event);
+      if (input->touchPoints().empty()) return false;
+      point = input->touchPoints().first().screenPos().toPoint();
+      begin = event->type() == QEvent::TouchBegin;
+      end = event->type() == QEvent::TouchEnd || cancel;
+    } else {
+      if (touchActive_ || (suppressMouse_ && clock_.elapsed() < 500)) return true;
+      auto* input = static_cast<QMouseEvent*>(event);
+      if (event->type() != QEvent::MouseMove && input->button() != Qt::LeftButton) return false;
+      point = input->globalPos();
+      begin = event->type() == QEvent::MouseButtonPress;
+      end = event->type() == QEvent::MouseButtonRelease;
+    }
+    if (begin) {
+      active_ = true; touchActive_ = touch; suppressMouse_ = touch;
+      moved_ = false; origin_ = point; scroll_ = list_->verticalScrollBar()->value();
+      clock_.start();
+    }
+    if (!active_) return false;
+    if ((point - origin_).manhattanLength() > qMax(12, QApplication::startDragDistance())) moved_ = true;
+    if (moved_) list_->verticalScrollBar()->setValue(scroll_ - (point.y() - origin_.y()));
+    if (end) {
+      active_ = touchActive_ = false;
+      if (!cancel && !moved_) {
+        if (auto* item = list_->itemAt(list_->viewport()->mapFromGlobal(point))) {
+          list_->setCurrentItem(item);
+          emit list_->itemClicked(item);
+        }
+      }
+    }
+    event->accept();
+    return true;
+  }
+ private:
+  QListWidget* list_;
+  QPoint origin_;
+  QElapsedTimer clock_;
+  int scroll_{0};
+  bool active_{false}, touchActive_{false}, suppressMouse_{false}, moved_{false};
+};
 
 // A touch browser stays in Qt's event loop and surface stack. The host's
 // Java chooser can be obscured by a visible wxQt plugin sheet even while it
@@ -44,6 +107,12 @@ public:
       hint->setWordWrap(true);
       layout->addWidget(hint);
     }
+    // Keep the editor above the file list: Android can pan an entire native
+    // dialog before Qt receives the IME resize if its focused field is low.
+    auto* name = new QLineEdit;
+    name->setPlaceholderText(QObject::tr("File name"));
+    if (m_flags & wxFD_SAVE) name->setText(QString::fromUtf8(m_name.ToUTF8().data()));
+    layout->addWidget(name);
     auto* locations = new QComboBox;
     locations->setItemDelegate(new WR_AndroidChoiceDelegate(locations));
     locations->addItem(QObject::tr("Current folder"), QString::fromUtf8(m_directory.ToUTF8().data()));
@@ -59,16 +128,12 @@ public:
     layout->addLayout(navigation);
     auto* files = new QListWidget;
     files->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
-    QScroller::grabGesture(files->viewport(), QScroller::TouchGesture);
+    new WR_PickerDragFilter(files);
     layout->addWidget(files, 1);
-    auto* name = new QLineEdit;
-    name->setPlaceholderText(QObject::tr("File name"));
-    if (m_flags & wxFD_SAVE) name->setText(QString::fromUtf8(m_name.ToUTF8().data()));
-    layout->addWidget(name);
     auto* error = new QLabel;
     error->setWordWrap(true);
     error->setStyleSheet("color: #9e2525;");
-    layout->addWidget(error);
+    layout->insertWidget(layout->indexOf(name) + 1, error);
     auto* actions = new QHBoxLayout;
     auto* newFolder = new QPushButton(QObject::tr("New folder"));
     auto* cancel = new QPushButton(QObject::tr("Cancel"));
@@ -77,9 +142,12 @@ public:
     actions->addWidget(newFolder);
     actions->addWidget(cancel);
     actions->addWidget(accept, 1);
-    layout->addLayout(actions);
+    // Native Android windows may keep their full height above the IME. Put
+    // actions with the filename rather than below the expanding file list.
+    layout->insertLayout(layout->indexOf(error) + 1, actions);
     QDir directory(QString::fromUtf8(m_directory.ToUTF8().data()));
-    if (!directory.exists()) directory = QDir(locations->itemData(1).toString());
+    if (m_directory.empty() || !directory.exists())
+      directory = QDir(locations->itemData(1).toString());
     QStringList masks;
     const QStringList parts = QString::fromUtf8(m_wildcard.ToUTF8().data()).split('|');
     for (int i = 1; i < parts.size(); i += 2) masks.append(parts[i].split(';', QString::SkipEmptyParts));
@@ -195,8 +263,28 @@ public:
       create.exec();
     });
     refresh();
-    const QRect bounds = QApplication::primaryScreen()->availableGeometry().adjusted(12, 12, -12, -12);
-    browser.setGeometry(bounds);
+    const auto fit = [&browser, locations, up, folder]() {
+      QRect bounds = QApplication::primaryScreen()->availableGeometry().adjusted(12, 12, -12, -12);
+      auto* input = QApplication::inputMethod();
+      // On a landscape tablet the keyboard leaves too little height for both
+      // folder navigation and the action row. Restore navigation on dismissal.
+      locations->setVisible(!input->isVisible());
+      up->setVisible(!input->isVisible());
+      folder->setVisible(!input->isVisible());
+      browser.layout()->invalidate();
+      browser.layout()->activate();
+      if (input->isVisible()) {
+        // Some Android hosts already remove the IME from availableGeometry.
+        // Cap at the keyboard edge instead of subtracting its height twice.
+        const int keyboardTop = QApplication::primaryScreen()->geometry().bottom() + 1 -
+            int(input->keyboardRectangle().height());
+        bounds.setBottom(qMax(bounds.top() + 300, qMin(bounds.bottom(), keyboardTop - 12)));
+      }
+      browser.setGeometry(bounds);
+    };
+    QObject::connect(QApplication::inputMethod(), &QInputMethod::keyboardRectangleChanged, &browser, fit);
+    QObject::connect(QApplication::inputMethod(), &QInputMethod::visibleChanged, &browser, fit);
+    fit();
     const int result = browser.exec();
     if (result != wxID_OK || m_path.IsEmpty()) return wxID_CANCEL;
     if (!(m_flags & wxFD_SAVE) && !multiple && !wxFileName::FileExists(m_path)) {
