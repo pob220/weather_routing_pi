@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+
+plugin_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+runtime_root="$plugin_root/runtime"
+
+if [ -n "${LD_LIBRARY_PATH:-}" ]; then
+  export LD_LIBRARY_PATH="$runtime_root/lib:$LD_LIBRARY_PATH"
+else
+  export LD_LIBRARY_PATH="$runtime_root/lib"
+fi
+export ECCODES_DEFINITION_PATH="$runtime_root/share/eccodes/definitions"
+export ECCODES_SAMPLES_PATH="$runtime_root/share/eccodes/samples"
+export PROJ_DATA="$runtime_root/share/proj"
+
+exec "$plugin_root/libexec/environmental-grib.bin" "$@"

@@ -1,0 +1,88 @@
+set(_helper "@CMAKE_CURRENT_BINARY_DIR@/generator/environmental-grib.bin")
+set(_runtime_root
+    "${CMAKE_INSTALL_PREFIX}/share/opencpn/plugins/@PACKAGE_NAME@/runtime")
+set(_runtime_lib "${_runtime_root}/lib")
+set(_runtime_licenses "${_runtime_root}/licenses")
+# file(INSTALL) applies DESTDIR itself; file(COPY)/MAKE_DIRECTORY do not.
+file(MAKE_DIRECTORY "$ENV{DESTDIR}${_runtime_lib}")
+file(MAKE_DIRECTORY "$ENV{DESTDIR}${_runtime_licenses}")
+
+file(GET_RUNTIME_DEPENDENCIES
+  EXECUTABLES "${_helper}"
+  DIRECTORIES
+    "@CMAKE_INSTALL_PREFIX@/lib"
+    "@CMAKE_INSTALL_PREFIX@/lib64"
+  RESOLVED_DEPENDENCIES_VAR _dependencies
+  UNRESOLVED_DEPENDENCIES_VAR _unresolved
+  POST_EXCLUDE_REGEXES
+    ".*/ld-linux[^/]*\\.so.*"
+    ".*/libc\\.so.*"
+    ".*/libm\\.so.*"
+    ".*/libgcc_s\\.so.*"
+    ".*/libstdc\\+\\+\\.so.*"
+    ".*/libpthread\\.so.*"
+    ".*/libdl\\.so.*"
+    ".*/librt\\.so.*")
+
+if(_unresolved)
+  message(FATAL_ERROR
+    "Unresolved Environmental GRIB helper dependencies: ${_unresolved}")
+endif()
+
+foreach(_dependency IN LISTS _dependencies)
+  file(INSTALL DESTINATION "${_runtime_lib}" TYPE SHARED_LIBRARY
+       FOLLOW_SYMLINK_CHAIN FILES "${_dependency}")
+endforeach()
+
+# Catalogue archives redistribute the selected libraries, so preserve the
+# build distribution's corresponding license records where its package manager
+# exposes them. Missing records remain visible through THIRD_PARTY_NOTICES.md
+# and must be resolved before publishing a release artifact.
+find_program(_pacman pacman)
+find_program(_dpkg_query dpkg-query)
+function(_copy_license_directory _source _destination)
+  # Distribution license directories can link to a central SPDX directory.
+  # Materialise those texts so the archive has no host-absolute symlinks.
+  file(GLOB_RECURSE _texts FOLLOW_SYMLINKS LIST_DIRECTORIES false "${_source}/*")
+  foreach(_text IN LISTS _texts)
+    file(RELATIVE_PATH _relative "${_source}" "${_text}")
+    get_filename_component(_parent "${_relative}" DIRECTORY)
+    get_filename_component(_name "${_relative}" NAME)
+    file(REAL_PATH "${_text}" _actual)
+    file(INSTALL DESTINATION "${_destination}/${_parent}" TYPE FILE
+      RENAME "${_name}" FILES "${_actual}")
+  endforeach()
+endfunction()
+foreach(_dependency IN LISTS _dependencies)
+  set(_package "")
+  if(_pacman)
+    execute_process(COMMAND "${_pacman}" -Qqo "${_dependency}"
+      RESULT_VARIABLE _package_result OUTPUT_VARIABLE _package
+      ERROR_QUIET OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(_package_result EQUAL 0 AND IS_DIRECTORY "/usr/share/licenses/${_package}")
+      _copy_license_directory("/usr/share/licenses/${_package}"
+        "${_runtime_licenses}/${_package}")
+    endif()
+  elseif(_dpkg_query)
+    execute_process(COMMAND "${_dpkg_query}" -S "${_dependency}"
+      RESULT_VARIABLE _package_result OUTPUT_VARIABLE _package_line
+      ERROR_QUIET OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(_package_result EQUAL 0)
+      string(REGEX MATCH "^[^:]+" _package "${_package_line}")
+      if(EXISTS "/usr/share/doc/${_package}/copyright")
+        file(INSTALL DESTINATION "${_runtime_licenses}/${_package}"
+          TYPE FILE FILES "/usr/share/doc/${_package}/copyright")
+      endif()
+    endif()
+  endif()
+endforeach()
+
+# Source-built ARMHF ecCodes has no dpkg ownership record.
+if(EXISTS "/usr/local/share/licenses/eccodes")
+  _copy_license_directory("/usr/local/share/licenses/eccodes"
+    "${_runtime_licenses}/eccodes")
+endif()
+
+list(LENGTH _dependencies _dependency_count)
+message(STATUS
+  "Bundled ${_dependency_count} Environmental GRIB helper libraries")

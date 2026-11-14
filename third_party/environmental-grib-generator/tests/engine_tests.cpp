@@ -1,0 +1,1992 @@
+#include <atomic>
+#include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+#include <netcdf.h>
+#include <bzlib.h>
+#include <blosc.h>
+
+#include "environmental_grib/error.h"
+#include "environmental_grib/arco.h"
+#include "environmental_grib/environment.h"
+#include "environmental_grib/estimate.h"
+#include "environmental_grib/copernicus.h"
+#include "environmental_grib/geo.h"
+#include "environmental_grib/grib.h"
+#include "environmental_grib/job.h"
+#include "environmental_grib/metno.h"
+#include "environmental_grib/model.h"
+#include "environmental_grib/platform.h"
+#include "environmental_grib/netcdf.h"
+#include "environmental_grib/providers.h"
+#include "environmental_grib/remote_currents.h"
+#include "environmental_grib/rtofs.h"
+#include "environmental_grib/security.h"
+#include "environmental_grib/sources.h"
+#include "environmental_grib/tpxo.h"
+#include "environmental_grib/weather.h"
+#include "environmental_grib/waves.h"
+#include "environmental_grib/ukv.h"
+
+namespace eg = environmental_grib;
+
+namespace {
+int failures = 0;
+
+void Check(bool condition, const std::string& message) {
+  if (!condition) {
+    ++failures;
+    std::cerr << "FAIL: " << message << '\n';
+  }
+}
+
+template <typename Function>
+void ExpectValidation(Function function, const std::string& message) {
+  try {
+    function();
+    Check(false, message);
+  } catch (const eg::ValidationError&) {
+  }
+}
+
+bool Near(double first, double second, double tolerance = 1e-10) {
+  return std::abs(first - second) <= tolerance;
+}
+
+void Nc(int status, const std::string& action) {
+  if (status != NC_NOERR)
+    throw std::runtime_error(action + ": " + nc_strerror(status));
+}
+
+void CreateNetCDF(const std::filesystem::path& path, int* file,
+                  const std::string& action) {
+  const auto utf8_path = eg::PathToUtf8(path);
+  Nc(nc_create(utf8_path.c_str(), NC_CLOBBER, file), action);
+}
+
+void WriteNetCDFFixture(const std::filesystem::path& path,
+                        const std::string& units) {
+  int file = -1;
+  CreateNetCDF(path, &file, "create fixture");
+  int time_dim = -1, lat_dim = -1, lon_dim = -1;
+  Nc(nc_def_dim(file, "time", 2, &time_dim), "time dimension");
+  Nc(nc_def_dim(file, "latitude", 3, &lat_dim), "latitude dimension");
+  Nc(nc_def_dim(file, "longitude", 3, &lon_dim), "longitude dimension");
+  int time_var = -1, lat_var = -1, lon_var = -1, u_var = -1, v_var = -1;
+  Nc(nc_def_var(file, "time", NC_DOUBLE, 1, &time_dim, &time_var),
+     "time variable");
+  Nc(nc_def_var(file, "latitude", NC_DOUBLE, 1, &lat_dim, &lat_var),
+     "latitude variable");
+  Nc(nc_def_var(file, "longitude", NC_DOUBLE, 1, &lon_dim, &lon_var),
+     "longitude variable");
+  const int dims[] = {time_dim, lat_dim, lon_dim};
+  Nc(nc_def_var(file, "eastward_sea_water_velocity", NC_DOUBLE, 3, dims,
+                &u_var),
+     "u variable");
+  Nc(nc_def_var(file, "northward_sea_water_velocity", NC_DOUBLE, 3, dims,
+                &v_var),
+     "v variable");
+  const std::string time_units = "hours since 2026-07-01 00:00:00";
+  Nc(nc_put_att_text(file, time_var, "units", time_units.size(),
+                     time_units.c_str()),
+     "time units");
+  Nc(nc_put_att_text(file, u_var, "units", units.size(), units.c_str()),
+     "u units");
+  Nc(nc_put_att_text(file, v_var, "units", units.size(), units.c_str()),
+     "v units");
+  Nc(nc_enddef(file), "end definitions");
+  const double times[] = {0.0, 1.0};
+  const double latitudes[] = {51.5, 52.0, 52.5};
+  const double longitudes[] = {-7.0, -6.5, -6.0};
+  std::vector<double> u_values(18, 1.0), v_values(18, 2.0);
+  Nc(nc_put_var_double(file, time_var, times), "time values");
+  Nc(nc_put_var_double(file, lat_var, latitudes), "latitude values");
+  Nc(nc_put_var_double(file, lon_var, longitudes), "longitude values");
+  Nc(nc_put_var_double(file, u_var, u_values.data()), "u values");
+  Nc(nc_put_var_double(file, v_var, v_values.data()), "v values");
+  Nc(nc_close(file), "close fixture");
+}
+
+void WriteTpxoModelFixture(const std::filesystem::path& root,
+                           const std::array<double, 3>& longitude_axis = {
+                               -1.0, -0.5, 0.0}) {
+  std::filesystem::create_directories(root);
+  const std::array<double, 3> latitude_axis{-1.0, -0.5, 0.0};
+  const double depth[] = {100.0, 100.0, 100.0, 100.0, 100.0,
+                          100.0, 100.0, 100.0, 100.0};
+  int file = -1, x = -1, y = -1;
+  CreateNetCDF(root / "grid_tpxo10atlas_v2.nc", &file,
+               "create TPXO grid fixture");
+  Nc(nc_def_dim(file, "nx", 3, &x), "TPXO grid x dimension");
+  Nc(nc_def_dim(file, "ny", 3, &y), "TPXO grid y dimension");
+  int lon_u = -1, lat_u = -1, lon_v = -1, lat_v = -1, hu = -1, hv = -1;
+  Nc(nc_def_var(file, "lon_u", NC_DOUBLE, 1, &x, &lon_u), "TPXO lon u");
+  Nc(nc_def_var(file, "lat_u", NC_DOUBLE, 1, &y, &lat_u), "TPXO lat u");
+  Nc(nc_def_var(file, "lon_v", NC_DOUBLE, 1, &x, &lon_v), "TPXO lon v");
+  Nc(nc_def_var(file, "lat_v", NC_DOUBLE, 1, &y, &lat_v), "TPXO lat v");
+  const int grid_dims[] = {x, y};
+  Nc(nc_def_var(file, "hu", NC_DOUBLE, 2, grid_dims, &hu), "TPXO hu");
+  Nc(nc_def_var(file, "hv", NC_DOUBLE, 2, grid_dims, &hv), "TPXO hv");
+  const std::string metres = "meter";
+  Nc(nc_put_att_text(file, hu, "units", metres.size(), metres.c_str()),
+     "TPXO hu units");
+  Nc(nc_put_att_text(file, hv, "units", metres.size(), metres.c_str()),
+     "TPXO hv units");
+  Nc(nc_enddef(file), "finish TPXO grid definitions");
+  Nc(nc_put_var_double(file, lon_u, longitude_axis.data()),
+     "TPXO lon u values");
+  Nc(nc_put_var_double(file, lat_u, latitude_axis.data()), "TPXO lat u values");
+  Nc(nc_put_var_double(file, lon_v, longitude_axis.data()),
+     "TPXO lon v values");
+  Nc(nc_put_var_double(file, lat_v, latitude_axis.data()), "TPXO lat v values");
+  Nc(nc_put_var_double(file, hu, depth), "TPXO hu values");
+  Nc(nc_put_var_double(file, hv, depth), "TPXO hv values");
+  Nc(nc_close(file), "close TPXO grid fixture");
+
+  CreateNetCDF(root / "u_m2_tpxo10_atlas_30_v2.nc", &file,
+               "create TPXO transport fixture");
+  int chars = -1;
+  Nc(nc_def_dim(file, "nx", 3, &x), "TPXO transport x dimension");
+  Nc(nc_def_dim(file, "ny", 3, &y), "TPXO transport y dimension");
+  Nc(nc_def_dim(file, "nct", 4, &chars), "TPXO constituent dimension");
+  int con = -1, u_real = -1, u_imag = -1, v_real = -1, v_imag = -1;
+  Nc(nc_def_var(file, "con", NC_CHAR, 1, &chars, &con), "TPXO constituent");
+  Nc(nc_def_var(file, "lon_u", NC_DOUBLE, 1, &x, &lon_u), "TPXO model lon u");
+  Nc(nc_def_var(file, "lat_u", NC_DOUBLE, 1, &y, &lat_u), "TPXO model lat u");
+  Nc(nc_def_var(file, "lon_v", NC_DOUBLE, 1, &x, &lon_v), "TPXO model lon v");
+  Nc(nc_def_var(file, "lat_v", NC_DOUBLE, 1, &y, &lat_v), "TPXO model lat v");
+  Nc(nc_def_var(file, "uRe", NC_DOUBLE, 2, grid_dims, &u_real), "TPXO u real");
+  Nc(nc_def_var(file, "uIm", NC_DOUBLE, 2, grid_dims, &u_imag), "TPXO u imag");
+  Nc(nc_def_var(file, "vRe", NC_DOUBLE, 2, grid_dims, &v_real), "TPXO v real");
+  Nc(nc_def_var(file, "vIm", NC_DOUBLE, 2, grid_dims, &v_imag), "TPXO v imag");
+  const std::string transport_units = "centimeter^2/sec";
+  for (const int variable : {u_real, u_imag, v_real, v_imag}) {
+    Nc(nc_put_att_text(file, variable, "units", transport_units.size(),
+                       transport_units.c_str()),
+       "TPXO transport units");
+  }
+  Nc(nc_enddef(file), "finish TPXO transport definitions");
+  const char constituent[] = {'m', '2', ' ', ' '};
+  const std::vector<double> u_values(9, 100000.0);
+  const std::vector<double> v_values(9, 50000.0);
+  const std::vector<double> zero_values(9, 0.0);
+  Nc(nc_put_var_text(file, con, constituent), "TPXO constituent value");
+  Nc(nc_put_var_double(file, lon_u, longitude_axis.data()),
+     "TPXO model lon u values");
+  Nc(nc_put_var_double(file, lat_u, latitude_axis.data()),
+     "TPXO model lat u values");
+  Nc(nc_put_var_double(file, lon_v, longitude_axis.data()),
+     "TPXO model lon v values");
+  Nc(nc_put_var_double(file, lat_v, latitude_axis.data()),
+     "TPXO model lat v values");
+  Nc(nc_put_var_double(file, u_real, u_values.data()), "TPXO u real values");
+  Nc(nc_put_var_double(file, u_imag, zero_values.data()), "TPXO u imag values");
+  Nc(nc_put_var_double(file, v_real, v_values.data()), "TPXO v real values");
+  Nc(nc_put_var_double(file, v_imag, zero_values.data()), "TPXO v imag values");
+  Nc(nc_close(file), "close TPXO transport fixture");
+}
+
+void WriteWaveFixture(const std::filesystem::path& path) {
+  int file = -1;
+  CreateNetCDF(path, &file, "create wave fixture");
+  int time_dim = -1, lat_dim = -1, lon_dim = -1;
+  Nc(nc_def_dim(file, "time", 2, &time_dim), "wave time dimension");
+  Nc(nc_def_dim(file, "latitude", 3, &lat_dim), "wave latitude dimension");
+  Nc(nc_def_dim(file, "longitude", 3, &lon_dim), "wave longitude dimension");
+  int time_var = -1, lat_var = -1, lon_var = -1;
+  Nc(nc_def_var(file, "time", NC_DOUBLE, 1, &time_dim, &time_var),
+     "wave time variable");
+  Nc(nc_def_var(file, "latitude", NC_DOUBLE, 1, &lat_dim, &lat_var),
+     "wave latitude variable");
+  Nc(nc_def_var(file, "longitude", NC_DOUBLE, 1, &lon_dim, &lon_var),
+     "wave longitude variable");
+  const int dims[] = {time_dim, lat_dim, lon_dim};
+  int height = -1, period = -1, direction = -1;
+  Nc(nc_def_var(file, "VHM0", NC_DOUBLE, 3, dims, &height), "wave height");
+  Nc(nc_def_var(file, "VTPK", NC_DOUBLE, 3, dims, &period), "wave period");
+  Nc(nc_def_var(file, "VMDR", NC_DOUBLE, 3, dims, &direction),
+     "wave direction");
+  const std::string time_units = "hours since 2026-07-01 00:00:00";
+  Nc(nc_put_att_text(file, time_var, "units", time_units.size(),
+                     time_units.c_str()),
+     "wave time units");
+  const std::string metres = "m", seconds = "s", degrees = "degrees";
+  Nc(nc_put_att_text(file, height, "units", metres.size(), metres.c_str()),
+     "height units");
+  Nc(nc_put_att_text(file, period, "units", seconds.size(), seconds.c_str()),
+     "period units");
+  Nc(nc_put_att_text(file, direction, "units", degrees.size(), degrees.c_str()),
+     "direction units");
+  Nc(nc_enddef(file), "end wave definitions");
+  const double times[] = {0.0, 3.0}, lats[] = {51.5, 52.0, 52.5},
+               lons[] = {-7.0, -6.5, -6.0};
+  std::vector<double> heights(18, 2.0), periods(18, 8.0), directions(18, 270.0);
+  Nc(nc_put_var_double(file, time_var, times), "wave times");
+  Nc(nc_put_var_double(file, lat_var, lats), "wave lats");
+  Nc(nc_put_var_double(file, lon_var, lons), "wave lons");
+  Nc(nc_put_var_double(file, height, heights.data()), "wave heights");
+  Nc(nc_put_var_double(file, period, periods.data()), "wave periods");
+  Nc(nc_put_var_double(file, direction, directions.data()), "wave directions");
+  Nc(nc_close(file), "close wave fixture");
+}
+
+void WriteRtofsFixture(const std::filesystem::path& path) {
+  int file = -1;
+  CreateNetCDF(path, &file, "create RTOFS fixture");
+  int mt = -1, depth = -1, y = -1, x = -1;
+  Nc(nc_def_dim(file, "MT", 1, &mt), "RTOFS MT");
+  Nc(nc_def_dim(file, "Depth", 1, &depth), "RTOFS depth");
+  Nc(nc_def_dim(file, "Y", 3, &y), "RTOFS Y");
+  Nc(nc_def_dim(file, "X", 3, &x), "RTOFS X");
+  const int coordinate_dims[] = {y, x};
+  const int field_dims[] = {mt, depth, y, x};
+  int latitude = -1, longitude = -1, u = -1, v = -1;
+  Nc(nc_def_var(file, "Latitude", NC_DOUBLE, 2, coordinate_dims, &latitude),
+     "RTOFS latitude");
+  Nc(nc_def_var(file, "Longitude", NC_DOUBLE, 2, coordinate_dims, &longitude),
+     "RTOFS longitude");
+  Nc(nc_def_var(file, "u", NC_DOUBLE, 4, field_dims, &u), "RTOFS u");
+  Nc(nc_def_var(file, "v", NC_DOUBLE, 4, field_dims, &v), "RTOFS v");
+  const std::string units = "m/s";
+  Nc(nc_put_att_text(file, u, "units", units.size(), units.c_str()),
+     "RTOFS u units");
+  Nc(nc_put_att_text(file, v, "units", units.size(), units.c_str()),
+     "RTOFS v units");
+  Nc(nc_enddef(file), "end RTOFS definitions");
+  const double latitudes[] = {30.0, 30.0, 30.0, 30.5, 30.55,
+                              30.5, 31.0, 31.0, 31.0};
+  const double longitudes[] = {-80.0, -79.5, -79.0, -80.0, -79.48,
+                               -79.0, -80.0, -79.5, -79.0};
+  std::vector<double> us(9), vs(9);
+  for (std::size_t i = 0; i < us.size(); ++i) {
+    us[i] = longitudes[i] * 0.01 + latitudes[i] * 0.02;
+    vs[i] = longitudes[i] * -0.03 + latitudes[i] * 0.01;
+  }
+  Nc(nc_put_var_double(file, latitude, latitudes), "RTOFS latitudes");
+  Nc(nc_put_var_double(file, longitude, longitudes), "RTOFS longitudes");
+  Nc(nc_put_var_double(file, u, us.data()), "RTOFS u values");
+  Nc(nc_put_var_double(file, v, vs.data()), "RTOFS v values");
+  Nc(nc_close(file), "close RTOFS fixture");
+}
+
+void WriteUkvFixture(const std::filesystem::path& path,
+                     const std::string& variable_name,
+                     const std::string& standard_name, const std::string& units,
+                     double value) {
+  int file = -1;
+  CreateNetCDF(path, &file, "create UKV fixture");
+  int y_dim = -1, x_dim = -1;
+  Nc(nc_def_dim(file, "projection_y_coordinate", 5, &y_dim), "UKV y dimension");
+  Nc(nc_def_dim(file, "projection_x_coordinate", 5, &x_dim), "UKV x dimension");
+  int y_var = -1, x_var = -1, mapping = -1, data = -1;
+  Nc(nc_def_var(file, "projection_y_coordinate", NC_DOUBLE, 1, &y_dim, &y_var),
+     "UKV y");
+  Nc(nc_def_var(file, "projection_x_coordinate", NC_DOUBLE, 1, &x_dim, &x_var),
+     "UKV x");
+  const int dims[] = {y_dim, x_dim};
+  Nc(nc_def_var(file, "lambert_azimuthal_equal_area", NC_INT, 0, nullptr,
+                &mapping),
+     "UKV mapping");
+  Nc(nc_def_var(file, variable_name.c_str(), NC_DOUBLE, 2, dims, &data),
+     "UKV field");
+  const std::string x_standard = "projection_x_coordinate",
+                    y_standard = "projection_y_coordinate";
+  Nc(nc_put_att_text(file, x_var, "standard_name", x_standard.size(),
+                     x_standard.c_str()),
+     "UKV x standard name");
+  Nc(nc_put_att_text(file, y_var, "standard_name", y_standard.size(),
+                     y_standard.c_str()),
+     "UKV y standard name");
+  const std::string mapping_name = "lambert_azimuthal_equal_area";
+  Nc(nc_put_att_text(file, mapping, "grid_mapping_name", mapping_name.size(),
+                     mapping_name.c_str()),
+     "UKV mapping name");
+  const double lat0 = 54.9, lon0 = -2.5, zero = 0.0, semi_major = 6378137.0,
+               inverse_flattening = 298.257223563;
+  Nc(nc_put_att_double(file, mapping, "latitude_of_projection_origin",
+                       NC_DOUBLE, 1, &lat0),
+     "UKV lat0");
+  Nc(nc_put_att_double(file, mapping, "longitude_of_projection_origin",
+                       NC_DOUBLE, 1, &lon0),
+     "UKV lon0");
+  Nc(nc_put_att_double(file, mapping, "false_easting", NC_DOUBLE, 1, &zero),
+     "UKV false easting");
+  Nc(nc_put_att_double(file, mapping, "false_northing", NC_DOUBLE, 1, &zero),
+     "UKV false northing");
+  Nc(nc_put_att_double(file, mapping, "semi_major_axis", NC_DOUBLE, 1,
+                       &semi_major),
+     "UKV semi major");
+  Nc(nc_put_att_double(file, mapping, "inverse_flattening", NC_DOUBLE, 1,
+                       &inverse_flattening),
+     "UKV inverse flattening");
+  Nc(nc_put_att_text(file, data, "grid_mapping", mapping_name.size(),
+                     mapping_name.c_str()),
+     "UKV field mapping");
+  Nc(nc_put_att_text(file, data, "standard_name", standard_name.size(),
+                     standard_name.c_str()),
+     "UKV standard name");
+  Nc(nc_put_att_text(file, data, "units", units.size(), units.c_str()),
+     "UKV units");
+  Nc(nc_enddef(file), "end UKV definitions");
+  const double axis[] = {-500000, -250000, 0, 250000, 500000};
+  std::vector<double> values(25, value);
+  Nc(nc_put_var_double(file, x_var, axis), "UKV x values");
+  Nc(nc_put_var_double(file, y_var, axis), "UKV y values");
+  Nc(nc_put_var_double(file, data, values.data()), "UKV field values");
+  Nc(nc_close(file), "close UKV fixture");
+}
+
+void WriteMetNoFixture(const std::filesystem::path& path) {
+  int file = -1;
+  CreateNetCDF(path, &file, "create MET Norway fixture");
+  int time_dim = -1, y_dim = -1, x_dim = -1;
+  Nc(nc_def_dim(file, "time", 6, &time_dim), "MET Norway time dimension");
+  Nc(nc_def_dim(file, "y", 7, &y_dim), "MET Norway y dimension");
+  Nc(nc_def_dim(file, "x", 7, &x_dim), "MET Norway x dimension");
+  int time = -1, reference = -1, y = -1, x = -1, mapping = -1;
+  Nc(nc_def_var(file, "time", NC_DOUBLE, 1, &time_dim, &time),
+     "MET Norway time");
+  Nc(nc_def_var(file, "forecast_reference_time", NC_DOUBLE, 0, nullptr,
+                &reference),
+     "MET Norway reference");
+  Nc(nc_def_var(file, "y", NC_DOUBLE, 1, &y_dim, &y), "MET Norway y");
+  Nc(nc_def_var(file, "x", NC_DOUBLE, 1, &x_dim, &x), "MET Norway x");
+  Nc(nc_def_var(file, "projection_lcc", NC_INT, 0, nullptr, &mapping),
+     "MET Norway mapping");
+  const int dimensions[] = {time_dim, y_dim, x_dim};
+  std::vector<int> fields;
+  for (const char* name :
+       {"air_temperature_2m", "precipitation_amount", "wind_direction_10m",
+        "wind_speed_10m", "wind_speed_of_gust", "cloud_area_fraction",
+        "air_pressure_at_sea_level", "relative_humidity_2m"}) {
+    int variable = -1;
+    Nc(nc_def_var(file, name, NC_DOUBLE, 3, dimensions, &variable),
+       std::string("MET Norway field ") + name);
+    const std::string mapping_name = "projection_lcc";
+    Nc(nc_put_att_text(file, variable, "grid_mapping", mapping_name.size(),
+                       mapping_name.c_str()),
+       "MET Norway field mapping");
+    fields.push_back(variable);
+  }
+  const std::string time_units = "seconds since 1970-01-01 00:00:00 +00:00";
+  for (const int variable : {time, reference})
+    Nc(nc_put_att_text(file, variable, "units", time_units.size(),
+                       time_units.c_str()),
+       "MET Norway time units");
+  const std::string mapping_name = "lambert_conformal_conic";
+  Nc(nc_put_att_text(file, mapping, "grid_mapping_name", mapping_name.size(),
+                     mapping_name.c_str()),
+     "MET Norway mapping name");
+  const double latitude_origin = 63.0, longitude_origin = 15.0,
+               radius = 6371000.0;
+  const double parallels[] = {63.0, 63.0};
+  Nc(nc_put_att_double(file, mapping, "latitude_of_projection_origin",
+                       NC_DOUBLE, 1, &latitude_origin),
+     "MET Norway projection origin");
+  Nc(nc_put_att_double(file, mapping, "longitude_of_central_meridian",
+                       NC_DOUBLE, 1, &longitude_origin),
+     "MET Norway central meridian");
+  Nc(nc_put_att_double(file, mapping, "standard_parallel", NC_DOUBLE, 2,
+                       parallels),
+     "MET Norway standard parallels");
+  Nc(nc_put_att_double(file, mapping, "earth_radius", NC_DOUBLE, 1, &radius),
+     "MET Norway earth radius");
+  Nc(nc_enddef(file), "end MET Norway definitions");
+  const auto reference_time = eg::ParseUtcDateTime("2026-07-27T00:00:00Z");
+  const double epoch =
+      static_cast<double>(std::chrono::duration_cast<std::chrono::seconds>(
+                              reference_time.time_since_epoch())
+                              .count());
+  const double times[] = {epoch,           epoch + 3600.0,  epoch + 7200.0,
+                          epoch + 10800.0, epoch + 14400.0, epoch + 18000.0};
+  const double axis[] = {-300000.0, -200000.0, -100000.0, 0.0,
+                         100000.0,  200000.0,  300000.0};
+  Nc(nc_put_var_double(file, time, times), "MET Norway times");
+  Nc(nc_put_var_double(file, reference, &epoch), "MET Norway reference value");
+  Nc(nc_put_var_double(file, x, axis), "MET Norway x values");
+  Nc(nc_put_var_double(file, y, axis), "MET Norway y values");
+  const std::array<double, 8> values{285.0, 1.0, 270.0,    10.0,
+                                     15.0,  0.6, 101500.0, 0.75};
+  for (std::size_t field = 0; field < fields.size(); ++field) {
+    std::vector<double> data(6 * 7 * 7, values[field]);
+    Nc(nc_put_var_double(file, fields[field], data.data()),
+       "MET Norway field values");
+  }
+  Nc(nc_close(file), "close MET Norway fixture");
+}
+
+std::vector<unsigned char> Bzip(const std::vector<unsigned char>& input) {
+  std::vector<unsigned char> output(input.size() + input.size() / 100 + 601);
+  unsigned int size = static_cast<unsigned int>(output.size());
+  const int status = BZ2_bzBuffToBuffCompress(
+      reinterpret_cast<char*>(output.data()), &size,
+      const_cast<char*>(reinterpret_cast<const char*>(input.data())),
+      static_cast<unsigned int>(input.size()), 9, 0, 30);
+  if (status != BZ_OK) throw std::runtime_error("test bzip compression failed");
+  output.resize(size);
+  return output;
+}
+
+std::vector<unsigned char> BloscInt16(const std::vector<std::int16_t>& input) {
+  std::vector<unsigned char> output(input.size() * sizeof(std::int16_t) +
+                                    BLOSC_MAX_OVERHEAD);
+  const int bytes = blosc_compress(5, 1, sizeof(std::int16_t),
+                                   input.size() * sizeof(std::int16_t),
+                                   input.data(), output.data(), output.size());
+  if (bytes <= 0) throw std::runtime_error("test Blosc compression failed");
+  output.resize(static_cast<std::size_t>(bytes));
+  return output;
+}
+
+std::vector<unsigned char> BloscFloat(const std::vector<float>& input) {
+  std::vector<unsigned char> output(input.size() * sizeof(float) +
+                                    BLOSC_MAX_OVERHEAD);
+  const int bytes =
+      blosc_compress(5, 1, sizeof(float), input.size() * sizeof(float),
+                     input.data(), output.data(), output.size());
+  if (bytes <= 0)
+    throw std::runtime_error("test float Blosc compression failed");
+  output.resize(static_cast<std::size_t>(bytes));
+  return output;
+}
+
+std::filesystem::path Temp(const std::string& name) {
+  static const std::string run_id =
+      std::to_string(eg::ProcessId()) + "-" +
+      std::to_string(
+          std::chrono::steady_clock::now().time_since_epoch().count());
+  return std::filesystem::temp_directory_path() /
+         ("environmental-grib-tests-" + run_id + "-" + name);
+}
+}  // namespace
+
+int main() {
+  Json::Value job_json(Json::objectValue);
+  job_json["schemaVersion"] = 1;
+  job_json["operation"] = "generateEnvironment";
+  auto& job_request = job_json["request"];
+  job_request["bbox"]["west"] = -8.5;
+  job_request["bbox"]["south"] = 50.5;
+  job_request["bbox"]["east"] = -2.5;
+  job_request["bbox"]["north"] = 56.5;
+  job_request["start"] = "2026-07-12T00:00:00Z";
+  job_request["hours"] = 24;
+  job_request["stepHours"] = 3;
+  job_request["weatherProvider"] = "gfs";
+  job_request["extendForecast"] = true;
+  job_request["fallbackWeatherProvider"] = "gfs";
+  job_request["fallbackWaveProvider"] = "gfs_wave";
+  job_request["fallbackCurrentSource"] = "offline-tidal";
+  job_request["currentSource"] = "none";
+  job_request["autoPrepareTpxoCache"] = true;
+  job_request["weatherFile"] = "navigation-航海/weather-åäö.grb2";
+  job_request["output"] = "navigation-航海/combined-åäö.grb2";
+  job_request["overwrite"] = true;
+  job_json["credentials"]["copernicusPasswordEnvironment"] = "TEST_SECRET";
+  const auto parsed_job = eg::ParseGeneratorJob(job_json);
+  Check(parsed_job.request.bbox.west == -8.5 &&
+            parsed_job.request.hours == 24 &&
+            parsed_job.request.weather_provider == "gfs" &&
+            parsed_job.request.extend_forecast &&
+            parsed_job.request.fallback_weather_provider == "gfs" &&
+            parsed_job.request.fallback_wave_provider == "gfs_wave" &&
+            parsed_job.request.fallback_current_source == "offline-tidal" &&
+            parsed_job.request.overwrite &&
+            parsed_job.request.auto_prepare_tpxo_cache,
+        "job protocol request mapping");
+  Check(parsed_job.request.weather_file &&
+            eg::PathToUtf8(*parsed_job.request.weather_file) ==
+                "navigation-航海/weather-åäö.grb2" &&
+            eg::PathToUtf8(parsed_job.request.output) ==
+                "navigation-航海/combined-åäö.grb2",
+        "job protocol preserves UTF-8 file paths");
+  Check(parsed_job.copernicus_password_environment == "TEST_SECRET",
+        "job protocol secret environment mapping");
+  const auto capabilities = eg::GeneratorCapabilitiesJson();
+  Check(capabilities["schemaVersion"].asInt() == 1 &&
+            capabilities["operations"][0].asString() == "generateEnvironment" &&
+            capabilities["weatherProviders"][5].asString() == "metno_nordic" &&
+            capabilities["weatherPresets"][3].asString() == "all" &&
+            capabilities["antimeridianBoundingBoxes"].asBool() &&
+            capabilities["generatorVersion"].asString() == "0.3.4",
+        "job protocol capabilities");
+  int retry_attempts = 0;
+  std::vector<int> retry_delays;
+  std::vector<std::pair<std::string, Json::Value>> retry_progress;
+  const auto retrying_download = eg::MakeRetryingHttpGet(
+      [&](const std::string&, double) -> std::vector<unsigned char> {
+        ++retry_attempts;
+        if (retry_attempts < 3)
+          throw eg::HttpDownloadError("simulated timeout", true);
+        return {1, 2, 3};
+      },
+      "test provider",
+      [&](const std::string& stage, const Json::Value& details) {
+        retry_progress.emplace_back(stage, details);
+      },
+      {.max_attempts = 3, .initial_delay_ms = 5, .maximum_delay_ms = 10},
+      [&](int delay) { retry_delays.push_back(delay); });
+  const auto retry_bytes =
+      retrying_download("https://example.invalid/data?username=secret", 1.0);
+  Check(retry_bytes.size() == 3 && retry_attempts == 3 &&
+            retry_delays == std::vector<int>({5, 10}),
+        "transient HTTP failures use bounded exponential retry");
+  Check(!retry_progress.empty() &&
+            retry_progress.back().second["resource"].asString() ==
+                "https://example.invalid/data" &&
+            retry_progress.back().second["resource"].asString().find(
+                "secret") == std::string::npos,
+        "retry progress identifies provider resource without query secrets");
+  Check(eg::SanitizedHttpResource(
+            "ftp://username:password@example.invalid/path?token=secret") ==
+            "ftp://example.invalid/path",
+        "retry diagnostics remove URL credentials and query secrets");
+  int permanent_attempts = 0;
+  const auto permanent_failure = eg::MakeRetryingHttpGet(
+      [&](const std::string&, double) -> std::vector<unsigned char> {
+        ++permanent_attempts;
+        throw eg::HttpDownloadError("HTTP status 404", false);
+      },
+      "test provider", {},
+      {.max_attempts = 3, .initial_delay_ms = 0, .maximum_delay_ms = 0},
+      [](int) {});
+  ExpectValidation(
+      [&] { permanent_failure("https://example.invalid/missing", 1.0); },
+      "non-transient HTTP failure is reported");
+  Check(permanent_attempts == 1, "non-transient HTTP failure is not retried");
+  const auto has_current_source = [&](const std::string& source) {
+    for (const auto& value : capabilities["currentSources"]) {
+      if (value.asString() == source) return true;
+    }
+    return false;
+  };
+  for (const auto* source :
+       {"none", "auto", "existing-file", "tpxo", "tpxo-cache", "netcdf",
+        "synthetic", "marine_ie_irish_sea", "noaa_rtofs_global",
+        "copernicus_nws", "copernicus_global", "copernicus_ibi",
+        "copernicus_mediterranean"}) {
+    Check(has_current_source(source),
+          std::string("existing current source remains available: ") + source);
+  }
+  Check(has_current_source("offline-tidal"),
+        "Offline current is added to generator capabilities");
+  job_json["schemaVersion"] = 1;
+  job_request["currentSource"] = "offline-tidal";
+  job_request["offlineTidalFile"] = "/tmp/global.xtd";
+  job_request["offlineCurrentMode"] = "tide-expected-seasonal";
+  const auto offline_job = eg::ParseGeneratorJob(job_json);
+  Check(
+      offline_job.request.current_source == "offline-tidal" &&
+          offline_job.request.offline_tidal_file ==
+              std::filesystem::path("/tmp/global.xtd") &&
+          offline_job.request.offline_current_mode == "tide-expected-seasonal",
+      "job protocol maps the Offline current package path and explicit mode");
+  job_json["schemaVersion"] = 2;
+  bool rejected_job_schema = false;
+  try {
+    eg::ParseGeneratorJob(job_json);
+  } catch (const eg::ValidationError&) {
+    rejected_job_schema = true;
+  }
+  Check(rejected_job_schema, "job protocol rejects unsupported schema");
+
+  const auto tpxo_root = Temp("tpxo-layout");
+  const auto tpxo_atlas = tpxo_root / "TPXO10_atlas_v2";
+  std::filesystem::create_directories(tpxo_atlas);
+  std::ofstream(tpxo_atlas / "grid_tpxo10atlas_v2.nc").put('\0');
+  std::ofstream(tpxo_atlas / "u_m2_tpxo10_atlas_30_v2.nc").put('\0');
+  Check(eg::ResolveTpxo10AtlasDirectory(tpxo_root) == tpxo_atlas,
+        "TPXO parent directory resolves atlas");
+  Check(eg::ResolveTpxo10AtlasDirectory(tpxo_atlas) == tpxo_atlas,
+        "TPXO direct atlas directory resolves without duplication");
+
+  eg::EnvironmentRequest invalid_tpxo;
+  invalid_tpxo.bbox = {-8.5, 50.5, -2.5, 56.5};
+  invalid_tpxo.start = eg::ParseUtcDateTime("2026-07-12T00:00:00Z");
+  invalid_tpxo.hours = 6;
+  invalid_tpxo.step_hours = 3;
+  invalid_tpxo.weather_provider = "gfs";
+  invalid_tpxo.current_source = "tpxo-cache";
+  invalid_tpxo.input_cache = Temp("missing-cache.tpxocache");
+  invalid_tpxo.auto_prepare_tpxo_cache = true;
+  invalid_tpxo.tpxo_model_directory = Temp("missing-model");
+  invalid_tpxo.output = Temp("invalid-tpxo-output.grb");
+  invalid_tpxo.overwrite = true;
+  int preflight_http_calls = 0;
+  ExpectValidation(
+      [&] {
+        eg::GenerateEnvironment(invalid_tpxo, [&](const std::string&, double) {
+          ++preflight_http_calls;
+          return std::vector<unsigned char>{};
+        });
+      },
+      "invalid TPXO model rejected before generation");
+  Check(preflight_http_calls == 0,
+        "invalid TPXO model rejected before weather downloads");
+  std::filesystem::remove_all(tpxo_root);
+
+  const auto tpxo_units_root = Temp("tpxo-units");
+  const auto tpxo_units_atlas = tpxo_units_root / "TPXO10_atlas_v2";
+  WriteTpxoModelFixture(tpxo_units_atlas);
+  const auto tpxo_units_grid =
+      eg::BuildRegularGrid({-1.0, -1.0, 0.0, 0.0}, 0.5);
+  auto tpxo_units_cache = eg::LoadTpxo10AtlasModel(
+      tpxo_units_root, {-1.0, -1.0, 0.0, 0.0}, tpxo_units_grid);
+  Check(Near(tpxo_units_cache.u_cm_s.front().real(), 10.0) &&
+            Near(tpxo_units_cache.u_cm_s.front().imag(), 0.0) &&
+            Near(tpxo_units_cache.v_cm_s.front().real(), 5.0) &&
+            Near(tpxo_units_cache.v_cm_s.front().imag(), 0.0) &&
+            tpxo_units_cache.metadata["velocity_units"].asString() == "cm/s",
+        "TPXO metre bathymetry and cm2/s transport convert to cm/s");
+  const auto tpxo_seam_root = Temp("tpxo-seam");
+  const auto tpxo_seam_atlas = tpxo_seam_root / "TPXO10_atlas_v2";
+  WriteTpxoModelFixture(tpxo_seam_atlas, {179.5, 180.0, 180.5});
+  const auto tpxo_seam_grid =
+      eg::BuildRegularGrid({-180.0, -1.0, -179.5, 0.0}, 0.5);
+  const auto tpxo_seam_cache = eg::LoadTpxo10AtlasModel(
+      tpxo_seam_root, {-180.0, -1.0, -179.5, 0.0}, tpxo_seam_grid);
+  Check(!tpxo_seam_cache.u_cm_s.empty() &&
+            std::isfinite(tpxo_seam_cache.u_cm_s.front().real()) &&
+            Near(tpxo_seam_cache.u_cm_s.front().real(), 10.0),
+        "TPXO negative dateline request maps back from 0..360 source axis");
+  for (const auto& longitude : {std::array<double,3>{170,180,190},
+                                  std::array<double,3>{-180,-60,60}}) {
+    WriteTpxoModelFixture(tpxo_seam_atlas, longitude);
+    const eg::BoundingBox crossing{170,-1,-170,0};
+    const auto crossing_grid = eg::BuildRegularGrid(crossing,.5);
+    const auto crossing_cache = eg::LoadTpxo10AtlasModel(tpxo_seam_root,crossing,crossing_grid);
+    Check(std::all_of(crossing_cache.u_cm_s.begin(),crossing_cache.u_cm_s.end(),
+                      [](const auto& value) { return Near(value.real(),10.0); }),
+          "direct TPXO windows interpolate across the date line and cyclic model seam");
+  }
+  std::filesystem::remove_all(tpxo_seam_root);
+  const auto predictor_time = eg::ParseUtcDateTime("2026-07-01T00:00:00Z");
+  const std::vector<std::string> predictor_constituents{"m2", "s2"};
+  const std::vector<std::complex<double>> predictor_coefficients{{10.0, 2.0},
+                                                                 {5.0, -1.0}};
+  const auto predictor = eg::PredictAtlasHarmonicGrid(predictor_constituents,
+                                                      predictor_coefficients, 1,
+                                                      {predictor_time}, false);
+  std::vector<std::complex<double>> doubled = predictor_coefficients;
+  for (auto& value : doubled) value *= 2.0;
+  const auto predictor_doubled = eg::PredictAtlasHarmonicGrid(
+      predictor_constituents, doubled, 1, {predictor_time}, false);
+  Check(predictor.size() == 1 &&
+            Near(predictor_doubled.front(), predictor.front() * 2.0),
+        "ATLAS component predictor preserves coefficient units and linearity");
+  const auto predictor_reordered = eg::PredictAtlasHarmonicGrid(
+      {"s2", "m2"}, {predictor_coefficients[1], predictor_coefficients[0]}, 1,
+      {predictor_time}, false);
+  Check(Near(predictor_reordered.front(), predictor.front()),
+        "ATLAS component prediction is constituent-order independent");
+  const auto epoch = eg::ParseUtcDateTime("1992-01-01T00:00:00Z");
+  const auto phasor = [epoch](const std::string& constituent) {
+    const auto cosine = eg::PredictAtlasHarmonicGrid(
+                            {constituent}, {{1.0, 0.0}}, 1, {epoch}, false)
+                            .front();
+    const auto negative_sine =
+        eg::PredictAtlasHarmonicGrid({constituent}, {{0.0, 1.0}}, 1, {epoch},
+                                     false)
+            .front();
+    return std::complex<double>{cosine, -negative_sine};
+  };
+  const auto m2_phasor = phasor("m2");
+  Check(std::abs(phasor("m3") + std::polar(std::pow(std::abs(m2_phasor), 1.5),
+                                           1.5 * std::arg(m2_phasor))) < 1e-9,
+        "M3 uses the Doodson branch of one-and-a-half M2 arguments");
+  Check(std::abs(phasor("m6") - std::pow(m2_phasor, 3)) < 1e-9,
+        "M6 inherits three M2 astronomical arguments");
+  Check(std::abs(phasor("s4") - std::pow(phasor("s2"), 2)) < 1e-9,
+        "S4 inherits two S2 astronomical arguments");
+  Check(std::abs(phasor("m8") - std::pow(m2_phasor, 4)) < 2e-9,
+        "M8 inherits four M2 astronomical arguments");
+  Check(std::abs(phasor("n4") - std::pow(phasor("n2"), 2)) < 2e-9,
+        "N4 inherits two N2 astronomical arguments");
+  Check(std::abs(phasor("mks2") - phasor("m2") * phasor("k2") / phasor("s2")) <
+            2e-9,
+        "MKS2 inherits the M2 plus K2 minus S2 argument");
+  const std::vector<std::string> ticon3_constituents{
+      "2n2", "2q1", "eps2", "j1",  "k1",  "k2",  "l2", "lda2", "m1",   "m2",
+      "m3",  "m4",  "m6",   "m8",  "ma2", "mb2", "mf", "mu2",  "mks2", "mm",
+      "mn4", "ms4", "msf",  "msq", "mtm", "n2",  "n4", "nu2",  "o1",   "oo1",
+      "p1",  "q1",  "r2",   "s1",  "s2",  "s3",  "s4", "sa",   "ssa",  "t2"};
+  const std::vector<std::complex<double>> ticon3_unit_coefficients(
+      ticon3_constituents.size(), {1.0, 0.0});
+  const auto all_ticon3 = eg::PredictAtlasHarmonicGrid(
+      ticon3_constituents, ticon3_unit_coefficients, 1, {predictor_time},
+      false);
+  Check(all_ticon3.size() == 1 && std::isfinite(all_ticon3.front()),
+        "all 40 canonical TICON-3 constituents are predicted");
+  ExpectValidation(
+      [&] {
+        eg::PredictAtlasHarmonicGrid({"m2", "m2"}, predictor_coefficients, 1,
+                                     {predictor_time}, false);
+      },
+      "duplicate ATLAS harmonic constituents rejected");
+  ExpectValidation(
+      [&] {
+        eg::PredictAtlasHarmonicGrid({"m2", "s2"}, {{1.0, 0.0}}, 1,
+                                     {predictor_time}, false);
+      },
+      "malformed ATLAS harmonic dimensions rejected");
+  tpxo_units_cache.metadata.removeMember("velocity_units");
+  tpxo_units_cache.metadata["pyTMD_version"] = Json::nullValue;
+  const auto ambiguous_cache = Temp("ambiguous-native.tpxocache");
+  eg::WriteTpxoCache(ambiguous_cache, tpxo_units_cache, true);
+  ExpectValidation([&] { eg::LoadTpxoCache(ambiguous_cache); },
+                   "ambiguous legacy native TPXO cache rejected");
+  std::filesystem::remove_all(tpxo_units_root);
+  std::filesystem::remove(ambiguous_cache);
+
+  const eg::BoundingBox bbox{-1.0, 50.0, 0.0, 51.0};
+  bbox.Validate();
+  ExpectValidation([] { eg::BoundingBox{-4.0, 51.5, -4.0, 55.5}.Validate(); },
+                   "zero-width bbox rejected");
+  const auto grid = eg::BuildRegularGrid(bbox, 0.5);
+  Check(grid.nx() == 3 && grid.ny() == 3, "inclusive 3x3 grid");
+  Check(grid.longitudes == std::vector<double>({-1.0, -0.5, 0.0}),
+        "grid longitudes");
+  const auto start = eg::ParseUtcDateTime("2026-07-01T00:00:00Z");
+  Check(eg::FormatUtcDateTime(start) == "2026-07-01T00:00:00Z",
+        "UTC round trip");
+  Check(eg::FormatUtcDateTime(eg::ParseUtcDateTime(
+            "2026-07-01T01:00:00+01:00")) == "2026-07-01T00:00:00Z",
+        "timezone-qualified provider input normalizes to UTC");
+  ExpectValidation([] { eg::ParseUtcDateTime("2026-07-01T01:00:00"); },
+                   "timezone-free provider input rejected");
+  Check(eg::BuildTimeSequence(start, 6, 3).size() == 3, "time sequence count");
+  ExpectValidation([&] { eg::BuildTimeSequence(start, 5, 2); },
+                   "non-divisible time range rejected");
+
+  const auto [speed, direction] = eg::ComponentsToSpeedDirection(0.514444, 0.0);
+  Check(Near(speed, 1.0) && Near(direction, 90.0),
+        "component conversion eastward");
+  Check(Near(eg::DirectionErrorDegrees(350.0, 10.0), -20.0),
+        "direction error wraps");
+  const auto [u, v] = eg::SpeedDirectionToComponents(2.0, 90.0, "knots");
+  Check(Near(u, 1.028888) && std::abs(v) < 1e-12, "speed conversion knots");
+
+  const auto constant = eg::MakeConstantCurrent(bbox, start, grid, 1.0, 2.0);
+  Check(constant.u_mps.size() == 9 && constant.u_mps.front() == 1.0 &&
+            constant.v_mps.back() == 2.0,
+        "constant source");
+  const auto synthetic_a = eg::MakeSyntheticRotaryCurrent(bbox, start, grid);
+  const auto synthetic_b = eg::MakeSyntheticRotaryCurrent(bbox, start, grid);
+  Check(synthetic_a.u_mps == synthetic_b.u_mps &&
+            synthetic_a.v_mps == synthetic_b.v_mps,
+        "synthetic source deterministic");
+
+  eg::ProviderRegistry registry;
+  const auto& offline_current = registry.Get("offline-tidal");
+  Check(offline_current.description.find("TPXO") == std::string::npos &&
+            offline_current.resolution.find("Atlas") == std::string::npos &&
+            offline_current.product_id == "xgrib-global-currents.xtd",
+        "Offline current metadata remains distinct from the TPXO source");
+  const auto& direct_tpxo = registry.Get("tpxo");
+  Check(direct_tpxo.description.find("user-supplied TPXO10 Atlas") !=
+            std::string::npos,
+        "direct TPXO metadata states that the user supplies the Atlas");
+  Check(eg::SelectBestProviderForBbox({-6.5, 52.0, -4.5, 55.0}, 48, registry)
+                ->id == "marine_ie_irish_sea",
+        "Marine.ie selected for short Irish Sea request");
+  Check(eg::SelectBestProviderForBbox({-6.5, 52.0, -4.5, 55.0}, 96, registry)
+                ->id == "copernicus_nws",
+        "NWS selected beyond Marine.ie duration");
+  Check(registry.Get("copernicus_ibi").SupportsBbox({-8.5, 50.5, -2.5, 56.0}) &&
+            !registry.Get("copernicus_ibi")
+                 .SupportsBbox({-8.5, 50.5, -2.5, 56.5}),
+        "IBI provider enforces its published northern coverage boundary");
+  Check(registry.Get("copernicus_mediterranean")
+            .SupportsBbox({0.0, 35.0, 10.0, 42.0}),
+        "Mediterranean provider advertises its regional coverage");
+  Check(!registry.Get("noaa_rtofs_global")
+                .SupportsBbox({-6.5, 52.0, -4.5, 55.0}) &&
+            registry.Get("noaa_rtofs_global")
+                .SupportsBbox({-80.0, 30.0, -79.0, 31.0}),
+        "RTOFS advertises only downloadable public regions");
+  Check(eg::RedactText("https://x.test?a=1&password=secret") ==
+            "https://x.test?a=1&password=<redacted>",
+        "query secret redaction");
+
+  const auto minimal = Temp("minimal.grb");
+  const std::vector<unsigned char> message = {'G', 'R', 'I', 'B', 0,   0,
+                                              12,  1,   '7', '7', '7', '7'};
+  std::ofstream(minimal, std::ios::binary)
+      .write(reinterpret_cast<const char*>(message.data()), message.size());
+  Check(eg::ScanGribMessages(minimal).message_count == 1, "strict GRIB scan");
+  const auto wrapped = Temp("wrapped.grb");
+  const auto clean = Temp("clean.grb");
+  {
+    std::ofstream out(wrapped, std::ios::binary);
+    out << "wrapper";
+    out.write(reinterpret_cast<const char*>(message.data()), message.size());
+    out << "\r\r\n";
+    out.write(reinterpret_cast<const char*>(message.data()), message.size());
+    out << "tail";
+  }
+  const auto normalized = eg::NormalizeGribStream(wrapped, clean);
+  Check(normalized.message_count == 2 && normalized.clean_byte_count == 24,
+        "normalize wrapped GRIB");
+
+  const auto current_path = Temp("current.grb");
+  eg::WriteGrib1Currents({constant}, current_path);
+  const auto inspection = eg::InspectGrib(current_path);
+  Check(inspection["message_count"].asUInt64() == 2,
+        "ecCodes current writer messages");
+  Check(inspection["current_component_counts"]["u_49"].asUInt64() == 1 &&
+            inspection["current_component_counts"]["v_50"].asUInt64() == 1,
+        "ecCodes current parameters");
+  const auto minute_start = eg::ParseUtcDateTime("2026-07-01T00:37:00Z");
+  std::vector<eg::CurrentGrid> long_lead_currents;
+  for (const int hour : {0, 255, 256, 360}) {
+    auto current = constant;
+    current.time = minute_start + std::chrono::hours(hour);
+    long_lead_currents.push_back(std::move(current));
+  }
+  const auto long_current_path = Temp("long-current.grb");
+  eg::WriteGrib1Currents(long_lead_currents, long_current_path);
+  const auto long_inspection = eg::InspectGrib(long_current_path);
+  const auto find_current_message =
+      [&](const std::string& valid_time) -> const Json::Value* {
+    for (const auto& encoded : long_inspection["messages"])
+      if (encoded.get("parameter_number", 0).asInt64() == 49 &&
+          encoded.get("valid_time", "").asString() == valid_time)
+        return &encoded;
+    return nullptr;
+  };
+  const auto* hour_255 = find_current_message("20260711T1537");
+  const auto* hour_256 = find_current_message("20260711T1637");
+  const auto* hour_360 = find_current_message("20260716T0037");
+  Check(long_inspection["message_count"].asUInt64() == 8 &&
+            long_inspection["valid_times"].size() == 4 &&
+            long_inspection["first_valid_time"].asString() == "20260701T0037" &&
+            long_inspection["last_valid_time"].asString() == "20260716T0037",
+        "GRIB1 current writer preserves minute-aligned 15-day valid times");
+  Check(hour_255 && (*hour_255)["time_range_indicator"].asInt64() == 0 &&
+            (*hour_255)["p1"].asInt64() == 255 &&
+            (*hour_255)["p2"].asInt64() == 0,
+        "GRIB1 current hour 255 uses the one-octet lead");
+  Check(hour_256 && (*hour_256)["time_range_indicator"].asInt64() == 10 &&
+            (*hour_256)["p1"].asInt64() == 1 &&
+            (*hour_256)["p2"].asInt64() == 0 && hour_360 &&
+            (*hour_360)["time_range_indicator"].asInt64() == 10 &&
+            (*hour_360)["p1"].asInt64() == 1 &&
+            (*hour_360)["p2"].asInt64() == 104,
+        "GRIB1 current long leads use the standard two-octet encoding");
+  auto maximum_lead = constant;
+  maximum_lead.time = start + std::chrono::hours(65535);
+  const auto maximum_lead_path = Temp("maximum-current-lead.grb");
+  eg::WriteGrib1Currents({constant, maximum_lead}, maximum_lead_path);
+  Check(eg::InspectGrib(maximum_lead_path)["last_valid_time"].asString() ==
+            "20331221T1500",
+        "GRIB1 current writer accepts the complete unsigned 16-bit range");
+  auto excessive_lead = constant;
+  excessive_lead.time = start + std::chrono::hours(65536);
+  const auto excessive_lead_path = Temp("excessive-current-lead.grb");
+  std::filesystem::remove(excessive_lead_path);
+  ExpectValidation(
+      [&] {
+        eg::WriteGrib1Currents({constant, excessive_lead}, excessive_lead_path);
+      },
+      "GRIB1 current writer rejects leads beyond 65535 hours");
+  Check(!std::filesystem::exists(excessive_lead_path),
+        "unrepresentable current lead is rejected before output creation");
+  auto masked_current = constant;
+  masked_current.mask.assign(grid.size(), 0);
+  masked_current.mask.front() = 1;
+  masked_current.u_mps.front() = std::numeric_limits<double>::quiet_NaN();
+  masked_current.v_mps.front() = std::numeric_limits<double>::quiet_NaN();
+  const auto masked_current_path = Temp("masked-current.grb");
+  eg::WriteGrib1Currents({masked_current}, masked_current_path);
+  Check(eg::InspectGrib(masked_current_path)["message_count"].asUInt64() == 2,
+        "ecCodes current writer encodes masked non-finite cells");
+  const auto grib2_path = Temp("fields.grb2");
+  std::vector<eg::Grib2Field> grib2_fields;
+  for (const auto& name :
+       {"10u", "10v", "prmsl", "2t", "swh", "perpw", "dirpw"}) {
+    grib2_fields.push_back(
+        {0, name, std::vector<double>(grid.size(), 1.5), {}});
+  }
+  eg::WriteRegularLatLonGrib2(grid, start, grib2_fields, grib2_path);
+  const auto grib2_inspection = eg::InspectGrib(grib2_path);
+  Check(grib2_inspection["message_count"].asUInt64() == 7 &&
+            grib2_inspection["short_name_counts"]["10u"].asUInt64() == 1 &&
+            grib2_inspection["short_name_counts"]["swh"].asUInt64() == 1,
+        "generic GRIB2 weather/wave writer");
+
+  const auto weather_fields = eg::GfsVariablesForPreset("routing");
+  Check(weather_fields.contains("var_PRMSL") && !weather_fields.contains("var_PRES"),
+        "GFS routing requests PRMSL:mean sea level, not surface PRES");
+  const auto all_weather_fields = eg::GfsVariablesForPreset("all");
+  Check(all_weather_fields.contains("var_GUST") &&
+            all_weather_fields.contains("var_REFC") &&
+            all_weather_fields.contains("var_HGT") &&
+            all_weather_fields.contains("var_RH"),
+        "all displayable GFS preset includes surface and pressure fields");
+  const eg::GFSCycle known_cycle{"20260701", "00"};
+  const auto weather_url = eg::BuildGfsFilterUrl(
+      known_cycle, 6, {-8.5, 50.5, -2.5, 56.5}, weather_fields);
+  Check(
+      weather_url.find("file=gfs.t00z.pgrb2.0p25.f006") != std::string::npos &&
+          weather_url.find("dir=%2Fgfs.20260701%2F00%2Fatmos") !=
+              std::string::npos &&
+          weather_url.find("var_UGRD=on") != std::string::npos,
+      "GFS filter URL parity");
+  eg::GFSRequest cycle_request{{-1, 50, 0, 51}, Temp("unused.grb"), 6};
+  cycle_request.max_auto_cycles = 3;
+  const auto cycles = eg::GfsCycleCandidates(
+      cycle_request, eg::ParseUtcDateTime("2026-07-02T13:30:00Z"));
+  Check(cycles.size() == 3 && cycles[0].date == "20260702" &&
+            cycles[0].cycle == "12" && cycles[2].cycle == "00",
+        "GFS automatic cycle order");
+  std::ifstream source_bytes(current_path, std::ios::binary | std::ios::ate);
+  std::vector<unsigned char> downloaded(
+      static_cast<std::size_t>(source_bytes.tellg()));
+  source_bytes.seekg(0);
+  source_bytes.read(reinterpret_cast<char*>(downloaded.data()),
+                    static_cast<std::streamsize>(downloaded.size()));
+  const auto weather_fixture = Temp("weather-fixture.grb2");
+  eg::WriteRegularLatLonGrib2(
+      grid, start,
+      {{0, "10u", std::vector<double>(grid.size(), 4.0), {}},
+       {0, "10v", std::vector<double>(grid.size(), -2.0), {}}},
+      weather_fixture);
+  const auto wave_fixture = Temp("wave-fixture.grb2");
+  eg::WriteRegularLatLonGrib2(
+      grid, start,
+      {{0, "swh", std::vector<double>(grid.size(), 1.5), {}},
+       {0, "perpw", std::vector<double>(grid.size(), 7.0), {}}},
+      wave_fixture);
+  const auto fixture_bytes = [](const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary | std::ios::ate);
+    std::vector<unsigned char> bytes(static_cast<std::size_t>(input.tellg()));
+    input.seekg(0);
+    input.read(reinterpret_cast<char*>(bytes.data()),
+               static_cast<std::streamsize>(bytes.size()));
+    return bytes;
+  };
+  const auto weather_downloaded = fixture_bytes(weather_fixture);
+  const auto wave_downloaded = fixture_bytes(wave_fixture);
+  const auto weather_path = Temp("gfs.grb");
+  eg::GFSRequest weather_request{{-8.5, 50.5, -2.5, 56.5}, weather_path, 6};
+  weather_request.cycle = "00";
+  weather_request.date = "20260701";
+  const auto generated_weather = eg::GenerateGfs(
+      weather_request,
+      [&](const std::string&, double) { return weather_downloaded; });
+  Check(generated_weather.message_count == 6 &&
+            generated_weather.urls.size() == 3,
+        "GFS atomic segment assembly with injectable HTTP");
+  eg::GFSRequest readiness_request = weather_request;
+  readiness_request.output = Temp("gfs-readiness.grb");
+  readiness_request.cycle = "auto";
+  readiness_request.date = std::nullopt;
+  readiness_request.max_auto_cycles = 2;
+  std::atomic<int> incomplete_cycle_requests{0};
+  std::atomic<int> complete_cycle_requests{0};
+  const auto readiness_result = eg::GenerateGfs(
+      readiness_request,
+      [&](const std::string& url, double) {
+        if (url.find("gfs.20260702%2F12") != std::string::npos) {
+          ++incomplete_cycle_requests;
+          throw eg::HttpDownloadError("forecast file not yet available", false);
+        }
+        ++complete_cycle_requests;
+        return weather_downloaded;
+      },
+      eg::ParseUtcDateTime("2026-07-02T13:30:00Z"));
+  Check(readiness_result.cycle.date == "20260702" &&
+            readiness_result.cycle.cycle == "06" &&
+            incomplete_cycle_requests.load() == 1 &&
+            complete_cycle_requests.load() == 3,
+        "GFS probes the furthest hour once before downloading a cycle");
+
+  const auto direct_wave_url = eg::BuildGfsWaveFileUrl(known_cycle, 6);
+  Check(
+      direct_wave_url.find("/gfs.20260701/00/wave/gridded/"
+                           "gfswave.t00z.global.0p25.f006.grib2") !=
+              std::string::npos &&
+          eg::BuildGfsWaveIndexUrl(known_cycle, 6) == direct_wave_url + ".idx",
+      "GFS Wave direct file and inventory URL parity");
+  eg::GFSRequest indexed_wave_request = weather_request;
+  indexed_wave_request.output = Temp("gfs-wave-indexed.grb");
+  indexed_wave_request.hours = 0;
+  indexed_wave_request.waves = true;
+  int filter_requests = 0;
+  int inventory_requests = 0;
+  int range_requests = 0;
+  const std::string wave_inventory =
+      "1:0:d=2026070100:HTSGW:surface:anl:\n"
+      "2:100:d=2026070100:PERPW:surface:anl:\n"
+      "3:200:d=2026070100:DIRPW:surface:anl:\n"
+      "4:300:d=2026070100:OTHER:surface:anl:\n";
+  const auto indexed_wave = eg::GenerateGfs(
+      indexed_wave_request,
+      [&](const std::string& url, double) {
+        if (url.ends_with(".idx")) {
+          ++inventory_requests;
+          return std::vector<unsigned char>(wave_inventory.begin(),
+                                            wave_inventory.end());
+        }
+        ++filter_requests;
+        throw eg::HttpDownloadError("HTTP status 302 without Location", true);
+      },
+      std::nullopt, {},
+      [&](const std::string&, std::size_t, std::size_t, double) {
+        ++range_requests;
+        return wave_downloaded;
+      });
+  Check(
+      filter_requests == 1 && inventory_requests == 1 && range_requests == 1 &&
+          indexed_wave.urls.size() == 1 &&
+          indexed_wave.urls.front() == eg::BuildGfsWaveFileUrl(known_cycle, 0),
+      "GFS Wave falls back to official indexed field ranges");
+  Check(eg::DwdIconEuForecastHourSequence(6, 3) == std::vector<int>({0, 3, 6}),
+        "ICON-EU forecast cadence");
+  Check(eg::BuildDwdIconEuUrl({"20260701", "06"}, 3, "u_10m")
+                .find("2026070106_003_U_10M.grib2.bz2") != std::string::npos,
+        "ICON-EU URL parity");
+  const auto icon_marine = eg::DwdIconEuFieldsForPreset("marine");
+  Check(icon_marine.contains("10fg") && icon_marine.contains("tp") &&
+            icon_marine.contains("tcc"),
+        "ICON-EU marine preset includes comfort fields");
+  const auto icon_path = Temp("icon.grb");
+  eg::GFSRequest icon_request{{-8.5, 50.5, -2.5, 56.5}, icon_path, 0};
+  icon_request.cycle = "06";
+  icon_request.date = "20260701";
+  const auto compressed_current = Bzip(weather_downloaded);
+  const auto icon = eg::GenerateDwdIconEu(
+      icon_request,
+      [&](const std::string&, double) { return compressed_current; });
+  Check(icon.message_count == 8 && icon.urls.size() == 4,
+        "ICON-EU decompression and atomic field assembly");
+  const std::string hrrr_inventory =
+      "1:0:d=20260701:UGRD:10 m above ground:anl:\n"
+      "2:100:d=20260701:VGRD:10 m above ground:anl:\n"
+      "3:200:d=20260701:TMP:2 m above ground:anl:\n"
+      "4:300:d=20260701:PRES:surface:anl:\n"
+      "5:400:d=20260701:OTHER:surface:anl:\n";
+  const auto parsed_inventory = eg::ParseHrrrInventory(hrrr_inventory);
+  Check(parsed_inventory.size() == 5 && parsed_inventory[1].offset == 100,
+        "HRRR inventory parser");
+  const auto hrrr_marine = eg::HrrrVariablesForPreset("marine");
+  Check(hrrr_marine.contains("var_GUST") && hrrr_marine.contains("var_APCP") &&
+            hrrr_marine.contains("var_TCDC"),
+        "HRRR marine preset includes gust, precipitation, and cloud");
+  const auto hrrr_path = Temp("hrrr.grb");
+  eg::GFSRequest hrrr_request{{-100.0, 30.0, -90.0, 40.0}, hrrr_path, 0, 1};
+  hrrr_request.cycle = "06";
+  hrrr_request.date = "20260701";
+  const auto hrrr = eg::GenerateHrrr(
+      hrrr_request,
+      [&](const std::string&, double) {
+        return std::vector<unsigned char>(hrrr_inventory.begin(),
+                                          hrrr_inventory.end());
+      },
+      [&](const std::string&, std::size_t, std::size_t, double) {
+        return weather_downloaded;
+      });
+  Check(hrrr.message_count == 8 && hrrr.urls.size() == 1,
+        "HRRR indexed field assembly");
+  Check(eg::BuildEcmwfDataUrl({"20260710", "00"}, 6, false) ==
+            "https://data.ecmwf.int/forecasts/20260710/00z/ifs/0p25/oper/"
+            "20260710000000-6h-oper-fc.grib2",
+        "ECMWF Open Data URL parity");
+  Check(eg::BuildEcmwfDataUrl({"20260710", "00"}, 6, true) ==
+            "https://data.ecmwf.int/forecasts/20260710/00z/aifs-single/0p25/"
+            "oper/20260710000000-6h-oper-fc.grib2",
+        "ECMWF AIFS Single v2 URL parity");
+  Check(eg::UkvForecastHours(60, 1).back() == 60 &&
+            eg::UkvForecastHours(60, 1).size() == 57,
+        "UKV hourly then three-hour cadence");
+  Check(eg::UkvForecastHours(120, 1).front() == 0 &&
+            eg::UkvForecastHours(120, 1)[54] == 54 &&
+            eg::UkvForecastHours(120, 1)[55] == 57 &&
+            eg::UkvForecastHours(120, 1).back() == 120,
+        "UKV mixed cadence retains the 54-to-57 hour interpolation boundary");
+  Check(eg::UkvSourceKey("20260703T0000Z", 6, "wind_speed_at_10m") ==
+            "uk-deterministic-2km/20260703T0000Z/"
+            "20260703T0600Z-PT0006H00M-wind_speed_at_10m.nc",
+        "UKV source key parity");
+  std::string ecmwf_index;
+  for (const auto& field : {"10u", "10v", "msl", "2t"}) {
+    ecmwf_index += std::string("{\"_offset\":0,\"_length\":100,\"param\":\"") +
+                   field +
+                   "\",\"type\":\"fc\",\"step\":\"0\",\"levtype\":\"sfc\"}\n";
+  }
+  const auto ecmwf_path = Temp("ecmwf.grb");
+  eg::GFSRequest ecmwf_request{{-8.5, 50.5, -2.5, 56.5}, ecmwf_path, 0, 3};
+  ecmwf_request.cycle = "00";
+  ecmwf_request.date = "20260710";
+  const auto ecmwf = eg::GenerateEcmwfOpenData(
+      ecmwf_request, false,
+      [&](const std::string&, double) {
+        return std::vector<unsigned char>(ecmwf_index.begin(),
+                                          ecmwf_index.end());
+      },
+      [&](const std::string&, std::size_t, std::size_t, double) {
+        return weather_downloaded;
+      });
+  Check(ecmwf.message_count == 8 && ecmwf.urls.size() == 1,
+        "ECMWF index and range assembly");
+  auto wrapped_current = downloaded;
+  wrapped_current.insert(wrapped_current.begin(), {'w', 'r', 'a', 'p'});
+  wrapped_current.insert(wrapped_current.end(), {'t', 'a', 'i', 'l'});
+  const auto marine_path = Temp("marine.grb");
+  std::string marine_url;
+  const auto marine = eg::DownloadMarineIe(marine_path, true,
+                                           [&](const std::string& url, double) {
+                                             marine_url = url;
+                                             return wrapped_current;
+                                           });
+  Check(marine.inspection["current_component_counts"]["u_49"].asUInt64() == 1 &&
+            marine.skipped_byte_count == 8 &&
+            marine_url.find("ftpossapp2:FtpOssapp2@ftp.marine.ie") !=
+                std::string::npos,
+        "Marine.ie normalisation and current validation");
+  Check(eg::RtofsForecastHours(18, 6) == std::vector<int>({6, 12, 18}),
+        "RTOFS native forecast cadence");
+  Check(eg::RtofsRegionForBbox({-80.0, 30.0, -79.0, 31.0}) == "US_east",
+        "RTOFS regional coverage selection");
+  const auto rtofs_source = Temp("rtofs.nc");
+  const auto rtofs_output = Temp("rtofs.grb");
+  WriteRtofsFixture(rtofs_source);
+  eg::RtofsRequest rtofs_request;
+  rtofs_request.bbox = {-79.9, 30.1, -79.1, 30.9};
+  rtofs_request.output = rtofs_output;
+  rtofs_request.hours = 6;
+  rtofs_request.step_hours = 6;
+  rtofs_request.cycle = "00";
+  rtofs_request.date = "20260701";
+  rtofs_request.download_directory = Temp("rtofs-downloads");
+  rtofs_request.grid_spacing_deg = 0.4;
+  rtofs_request.overwrite = true;
+  const auto rtofs = eg::GenerateRtofs(
+      rtofs_request,
+      [](const std::string&, double) {
+        return std::string("rtofs_glo_3dz_f006_6hrly_hvr_US_east.nc");
+      },
+      [&](const std::string&, double) {
+        std::ifstream input(rtofs_source, std::ios::binary | std::ios::ate);
+        std::vector<unsigned char> bytes(
+            static_cast<std::size_t>(input.tellg()));
+        input.seekg(0);
+        input.read(reinterpret_cast<char*>(bytes.data()),
+                   static_cast<std::streamsize>(bytes.size()));
+        return bytes;
+      });
+  Check(rtofs.message_count == 2 &&
+            eg::InspectGrib(rtofs_output)["current_component_counts"]["u_49"]
+                    .asUInt64() == 1,
+        "RTOFS curvilinear Delaunay conversion");
+  const auto copernicus_output = Temp("copernicus.grb");
+  eg::CopernicusRequest copernicus_request;
+  copernicus_request.bbox = {-6.9, 52.1, -6.1, 52.9};
+  copernicus_request.start = start;
+  copernicus_request.hours = 0;
+  copernicus_request.grid_spacing_deg = 0.4;
+  copernicus_request.username = "test-user";
+  copernicus_request.password = "secret";
+  copernicus_request.output = copernicus_output;
+  copernicus_request.overwrite = true;
+  eg::EnvironmentRequest current_size_request;
+  current_size_request.bbox = copernicus_request.bbox;
+  current_size_request.start = start;
+  current_size_request.hours = copernicus_request.hours;
+  current_size_request.current_grid_spacing_deg = copernicus_request.grid_spacing_deg;
+  current_size_request.weather_provider = "none";
+  current_size_request.current_source = "copernicus_nws";
+  const auto current_size_estimate = eg::EstimateEnvironment(current_size_request);
+  const std::string copernicus_product =
+      R"({"links":[{"rel":"item","href":"cmems_mod_nws_phy-cur_anfc_1.5km-2D_PT1H-i_202607/dataset.stac.json"}]})";
+  const auto epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            start.time_since_epoch())
+                            .count();
+  const std::string copernicus_item =
+      std::string(
+          R"({"id":"cmems_mod_nws_phy-cur_anfc_1.5km-2D_PT1H-i_202607","assets":{"timeChunked":{"href":"https://test.invalid/nws.zarr","viewDims":{"latitude":{"coords":{"min":52.0,"max":53.0,"step":0.5,"len":3}},"longitude":{"coords":{"min":-7.0,"max":-6.0,"step":0.5,"len":3}},"time":{"coords":{"min":)") +
+      std::to_string(epoch_ms) + R"(,"max":)" + std::to_string(epoch_ms) +
+      R"(,"step":3600000,"len":1}}}}},"properties":{"cube:variables":{"uo":{"scale":0.001,"offset":0.0,"missingValue":-32768},"vo":{"scale":0.001,"offset":0.0,"missingValue":-32768}}}})";
+  const std::string client_config =
+      R"({"catalogues":[{"stacRoot":"https://s3.waw3-1.cloudferro.com/mdl-metadata/metadata/"}]})";
+  int primary_attempts = 0, mirror_attempts = 0;
+  const auto fallback_dataset = eg::DiscoverArcoDataset(
+      "NWSHELF_ANALYSISFORECAST_PHY_004_013",
+      "cmems_mod_nws_phy-cur_anfc_1.5km-2D_PT1H-i", "test-user",
+      [&](const std::string& url, double timeout) {
+        Check(timeout <= 20.0,
+              "Copernicus metadata attempt timeout is bounded");
+        if (url.find("stac.marine.copernicus.eu/clients-config-v1") !=
+            std::string::npos)
+          return std::vector<unsigned char>(client_config.begin(),
+                                            client_config.end());
+        if (url.find("s3.waw3-1.cloudferro.com") != std::string::npos) {
+          ++primary_attempts;
+          throw std::runtime_error("primary metadata unavailable");
+        }
+        if (url.find("s3.waw4-1.cloudferro.com") != std::string::npos) {
+          ++mirror_attempts;
+          if (url.find("product.stac.json") != std::string::npos)
+            return std::vector<unsigned char>(copernicus_product.begin(),
+                                              copernicus_product.end());
+          if (url.find("dataset.stac.json") != std::string::npos)
+            return std::vector<unsigned char>(copernicus_item.begin(),
+                                              copernicus_item.end());
+        }
+        throw std::runtime_error("unexpected fallback URL: " + url);
+      });
+  Check(primary_attempts == 1 && mirror_attempts == 2 &&
+            fallback_dataset.metadata_root.find("waw4-1") != std::string::npos,
+        "Copernicus metadata discovery falls back to official mirror");
+  bool roots_reported = false;
+  try {
+    eg::DiscoverArcoDataset(
+        "NWSHELF_ANALYSISFORECAST_PHY_004_013",
+        "cmems_mod_nws_phy-cur_anfc_1.5km-2D_PT1H-i", "test-user",
+        [](const std::string& url, double) -> std::vector<unsigned char> {
+          if (url.find("clients-config-v1") != std::string::npos) return {'{'};
+          throw std::runtime_error("unreachable");
+        });
+  } catch (const eg::ValidationError& error) {
+    const std::string message = error.what();
+    roots_reported = message.find("waw3-1") != std::string::npos &&
+                     message.find("waw4-1") != std::string::npos;
+  }
+  Check(roots_reported,
+        "Copernicus metadata failure reports every attempted official root");
+  const auto u_chunk =
+      BloscInt16({100, 200, 300, 200, 300, 400, 300, 400, 500});
+  const auto v_chunk =
+      BloscInt16({-100, -200, -300, -200, -300, -400, -300, -400, -500});
+  const auto copernicus = eg::GenerateCopernicusNws(
+      copernicus_request,
+      [&](const std::string& url, double) {
+        if (url.find("product.stac.json") != std::string::npos)
+          return std::vector<unsigned char>(copernicus_product.begin(),
+                                            copernicus_product.end());
+        if (url.find("dataset.stac.json") != std::string::npos)
+          return std::vector<unsigned char>(copernicus_item.begin(),
+                                            copernicus_item.end());
+        if (url.find("/uo/0.0.0") != std::string::npos) return u_chunk;
+        if (url.find("/vo/0.0.0") != std::string::npos) return v_chunk;
+        throw std::runtime_error("unexpected mocked Copernicus URL: " + url);
+      },
+      [](const std::string& username, const std::string& password, double) {
+        return username == "test-user" && password == "secret";
+      });
+  Check(
+      copernicus.message_count == 2 &&
+          copernicus.dataset_version.find("202607") != std::string::npos &&
+          eg::InspectGrib(copernicus_output)["current_component_counts"]["v_50"]
+                  .asUInt64() == 1,
+      "Copernicus dynamic STAC and Blosc Zarr conversion");
+  eg::EnvironmentResult current_size_result;
+  current_size_result.output = copernicus_output;
+  current_size_result.inspection = eg::InspectGrib(copernicus_output);
+  current_size_result.message_count = copernicus.message_count;
+  current_size_result.byte_count = copernicus.byte_count;
+  const auto current_size_report = eg::BuildSizeComparison(
+      current_size_request, current_size_estimate, current_size_result);
+  Check(current_size_report["numericStatus"].asString() == "exact" &&
+        current_size_report["fileStatus"].asString() == "within_upper_estimate",
+        "pre-generation Copernicus estimate matches mocked provider conversion");
+  const auto copernicus_partial_output = Temp("copernicus-partial.grb");
+  eg::CopernicusRequest copernicus_partial_request = copernicus_request;
+  copernicus_partial_request.hours = 2;
+  copernicus_partial_request.allow_partial_time_coverage = true;
+  copernicus_partial_request.output = copernicus_partial_output;
+  const std::string copernicus_partial_item =
+      std::string(
+          R"({"id":"cmems_mod_nws_phy-cur_anfc_1.5km-2D_PT1H-i_202607","assets":{"timeChunked":{"href":"https://test.invalid/nws.zarr","viewDims":{"latitude":{"coords":{"min":52.0,"max":53.0,"step":0.5,"len":3}},"longitude":{"coords":{"min":-7.0,"max":-6.0,"step":0.5,"len":3}},"time":{"coords":{"min":)") +
+      std::to_string(epoch_ms) + R"(,"max":)" +
+      std::to_string(epoch_ms + 3600000) +
+      R"(,"step":3600000,"len":2}}}}},"properties":{"cube:variables":{"uo":{"scale":0.001,"offset":0.0,"missingValue":-32768},"vo":{"scale":0.001,"offset":0.0,"missingValue":-32768}}}})";
+  const auto copernicus_partial = eg::GenerateCopernicusNws(
+      copernicus_partial_request,
+      [&](const std::string& url, double) {
+        if (url.find("product.stac.json") != std::string::npos)
+          return std::vector<unsigned char>(copernicus_product.begin(),
+                                            copernicus_product.end());
+        if (url.find("dataset.stac.json") != std::string::npos)
+          return std::vector<unsigned char>(copernicus_partial_item.begin(),
+                                            copernicus_partial_item.end());
+        if (url.find("/uo/0.0.0") != std::string::npos ||
+            url.find("/uo/1.0.0") != std::string::npos)
+          return u_chunk;
+        if (url.find("/vo/0.0.0") != std::string::npos ||
+            url.find("/vo/1.0.0") != std::string::npos)
+          return v_chunk;
+        throw std::runtime_error("unexpected partial NWS URL: " + url);
+      },
+      [](const std::string&, const std::string&, double) { return true; });
+  Check(
+      copernicus_partial.message_count == 4 &&
+          copernicus_partial.summary["requested_time_count"].asUInt64() == 3 &&
+          copernicus_partial.summary["time_count"].asUInt64() == 2 &&
+          copernicus_partial.summary["partial_time_coverage"].asBool() &&
+          eg::InspectGrib(copernicus_partial_output)["last_valid_time"]
+                  .asString() == "20260701T0100",
+      "Copernicus NWS extension mode retains its contiguous available "
+      "prefix");
+  eg::CopernicusRequest copernicus_strict_request = copernicus_partial_request;
+  copernicus_strict_request.allow_partial_time_coverage = false;
+  copernicus_strict_request.output = Temp("copernicus-strict-range.grb");
+  ExpectValidation(
+      [&] {
+        eg::GenerateCopernicusNws(
+            copernicus_strict_request,
+            [&](const std::string& url, double) {
+              if (url.find("product.stac.json") != std::string::npos)
+                return std::vector<unsigned char>(copernicus_product.begin(),
+                                                  copernicus_product.end());
+              if (url.find("dataset.stac.json") != std::string::npos)
+                return std::vector<unsigned char>(
+                    copernicus_partial_item.begin(),
+                    copernicus_partial_item.end());
+              if (url.find("/uo/") != std::string::npos) return u_chunk;
+              if (url.find("/vo/") != std::string::npos) return v_chunk;
+              throw std::runtime_error("unexpected strict NWS URL: " + url);
+            },
+            [](const std::string&, const std::string&, double) {
+              return true;
+            });
+      },
+      "direct Copernicus NWS requests retain strict time coverage");
+  const auto global_current_output = Temp("copernicus-global.grb");
+  eg::CopernicusRequest global_request = copernicus_request;
+  global_request.provider = "copernicus_global";
+  global_request.output = global_current_output;
+  const std::string global_product =
+      R"({"links":[{"rel":"item","href":"cmems_mod_glo_phy_anfc_0.083deg_PT1H-m_202607/dataset.stac.json"}]})";
+  const std::string global_item =
+      std::string(
+          R"({"id":"cmems_mod_glo_phy_anfc_0.083deg_PT1H-m_202607","assets":{"timeChunked":{"href":"https://test.invalid/global.zarr","viewDims":{"elevation":{"chunkLen":{"uo":1,"vo":1},"len":1,"coords":{"type":"explicit","values":[-0.5]}},"latitude":{"chunkLen":{"uo":3,"vo":3},"coords":{"type":"minMaxStep","min":52.0,"max":53.0,"step":0.5,"len":3}},"longitude":{"chunkLen":{"uo":3,"vo":3},"coords":{"type":"minMaxStep","min":-7.0,"max":-6.0,"step":0.5,"len":3}},"time":{"chunkLen":{"uo":1,"vo":1},"coords":{"type":"minMaxStep","min":)") +
+      std::to_string(epoch_ms) + R"(,"max":)" + std::to_string(epoch_ms) +
+      R"(,"step":3600000,"len":1}}},"viewVariables":{"uo":{"dtype":"<f4"},"vo":{"dtype":"<f4"}}}},"properties":{"cube:variables":{"uo":{"dimensions":["time","elevation","latitude","longitude"],"scale":null,"offset":null,"missingValue":9.96921e36},"vo":{"dimensions":["time","elevation","latitude","longitude"],"scale":null,"offset":null,"missingValue":9.96921e36}}}})";
+  const auto global_u =
+      BloscFloat({.1f, .2f, .3f, .2f, .3f, .4f, .3f, .4f, .5f});
+  const auto global_v =
+      BloscFloat({-.1f, -.2f, -.3f, -.2f, -.3f, -.4f, -.3f, -.4f, -.5f});
+  const auto global_current = eg::GenerateCopernicusGlobal(
+      global_request,
+      [&](const std::string& url, double) {
+        if (url.find("product.stac.json") != std::string::npos)
+          return std::vector<unsigned char>(global_product.begin(),
+                                            global_product.end());
+        if (url.find("dataset.stac.json") != std::string::npos)
+          return std::vector<unsigned char>(global_item.begin(),
+                                            global_item.end());
+        if (url.find("/uo/0.0.0.0") != std::string::npos) return global_u;
+        if (url.find("/vo/0.0.0.0") != std::string::npos) return global_v;
+        throw std::runtime_error("unexpected mocked Global URL: " + url);
+      },
+      [](const std::string&, const std::string&, double) { return true; });
+  Check(global_current.message_count == 2 &&
+            eg::InspectGrib(
+                global_current_output)["current_component_counts"]["u_49"]
+                    .asUInt64() == 1,
+        "Copernicus Global float32 four-dimensional ARCO conversion");
+  eg::CopernicusRequest global_partial_request = global_request;
+  global_partial_request.hours = 1;
+  global_partial_request.allow_partial_time_coverage = true;
+  global_partial_request.output = Temp("copernicus-global-partial.grb");
+  const auto global_partial = eg::GenerateCopernicusGlobal(
+      global_partial_request,
+      [&](const std::string& url, double) {
+        if (url.find("product.stac.json") != std::string::npos)
+          return std::vector<unsigned char>(global_product.begin(),
+                                            global_product.end());
+        if (url.find("dataset.stac.json") != std::string::npos)
+          return std::vector<unsigned char>(global_item.begin(),
+                                            global_item.end());
+        if (url.find("/uo/0.0.0.0") != std::string::npos) return global_u;
+        if (url.find("/vo/0.0.0.0") != std::string::npos) return global_v;
+        throw std::runtime_error("unexpected partial Global URL: " + url);
+      },
+      [](const std::string&, const std::string&, double) { return true; });
+  Check(global_partial.message_count == 2 &&
+            global_partial.summary["requested_time_count"].asUInt64() == 2 &&
+            global_partial.summary["time_count"].asUInt64() == 1 &&
+            global_partial.summary["partial_time_coverage"].asBool(),
+        "shared Copernicus ARCO path retains an available prefix only when "
+        "extension mode permits it");
+  const auto ibi_current_output = Temp("copernicus-ibi.grb");
+  eg::CopernicusRequest ibi_request = global_request;
+  ibi_request.provider = "copernicus_ibi";
+  ibi_request.output = ibi_current_output;
+  const std::string ibi_product =
+      R"({"links":[{"rel":"item","href":"cmems_mod_ibi_phy_anfc_0.027deg-2D_PT1H-m_202411/dataset.stac.json"}]})";
+  const auto ibi_current = eg::GenerateCopernicusIbi(
+      ibi_request,
+      [&](const std::string& url, double) {
+        if (url.find("product.stac.json") != std::string::npos)
+          return std::vector<unsigned char>(ibi_product.begin(),
+                                            ibi_product.end());
+        if (url.find("dataset.stac.json") != std::string::npos)
+          return std::vector<unsigned char>(global_item.begin(),
+                                            global_item.end());
+        if (url.find("/uo/0.0.0.0") != std::string::npos) return global_u;
+        if (url.find("/vo/0.0.0.0") != std::string::npos) return global_v;
+        throw std::runtime_error("unexpected mocked IBI URL: " + url);
+      },
+      [](const std::string&, const std::string&, double) { return true; });
+  Check(ibi_current.message_count == 2 &&
+            ibi_current.summary["provider"].asString() == "copernicus_ibi" &&
+            eg::InspectGrib(
+                ibi_current_output)["current_component_counts"]["v_50"]
+                    .asUInt64() == 1,
+        "Copernicus IBI uses the shared ARCO current-to-GRIB path");
+  const auto remote_wave_output = Temp("copernicus-remote-waves.grb2");
+  const std::string wave_product =
+      R"({"links":[{"rel":"item","href":"cmems_mod_glo_wav_anfc_0.083deg_PT3H-i_202607/dataset.stac.json"}]})";
+  const std::string wave_item =
+      std::string(
+          R"({"id":"cmems_mod_glo_wav_anfc_0.083deg_PT3H-i_202607","assets":{"timeChunked":{"href":"https://test.invalid/waves.zarr","viewDims":{"latitude":{"chunkLen":{"VHM0":3,"VTPK":3,"VMDR":3},"coords":{"type":"minMaxStep","min":52.0,"max":53.0,"step":0.5,"len":3}},"longitude":{"chunkLen":{"VHM0":3,"VTPK":3,"VMDR":3},"coords":{"type":"minMaxStep","min":-7.0,"max":-6.0,"step":0.5,"len":3}},"time":{"chunkLen":{"VHM0":1,"VTPK":1,"VMDR":1},"coords":{"type":"minMaxStep","min":)") +
+      std::to_string(epoch_ms) + R"(,"max":)" + std::to_string(epoch_ms) +
+      R"(,"step":10800000,"len":1}}},"viewVariables":{"VHM0":{"dtype":"<i2"},"VTPK":{"dtype":"<i2"},"VMDR":{"dtype":"<i2"}}}},"properties":{"cube:variables":{"VHM0":{"dimensions":["time","latitude","longitude"],"scale":0.01,"offset":0,"missingValue":-32767},"VTPK":{"dimensions":["time","latitude","longitude"],"scale":0.01,"offset":0,"missingValue":-32767},"VMDR":{"dimensions":["time","latitude","longitude"],"scale":0.01,"offset":180,"missingValue":-32767}}}})";
+  const auto height_chunk = BloscInt16(std::vector<std::int16_t>(9, 200));
+  const auto period_chunk = BloscInt16(std::vector<std::int16_t>(9, 800));
+  const auto direction_chunk = BloscInt16(std::vector<std::int16_t>(9, 9000));
+  eg::EnvironmentRequest wave_size_request;
+  wave_size_request.bbox = {-7.0, 51.5, -6.0, 52.5};
+  wave_size_request.start = start + std::chrono::hours(1);
+  wave_size_request.hours = 0;
+  wave_size_request.weather_provider = "none";
+  wave_size_request.weather_grid_spacing_deg = 0.5;
+  wave_size_request.include_waves = true;
+  wave_size_request.wave_provider = "copernicus_global_waves";
+  const auto wave_size_estimate = eg::EstimateEnvironment(wave_size_request);
+  const auto remote_waves = eg::GenerateCopernicusGlobalWaves(
+      eg::BoundingBox{-7.0, 51.5, -6.0, 52.5}, start + std::chrono::hours(1), 0,
+      3, "test-user", "secret", remote_wave_output, 0.5, true,
+      [&](const std::string& url, double) {
+        if (url.find("product.stac.json") != std::string::npos)
+          return std::vector<unsigned char>(wave_product.begin(),
+                                            wave_product.end());
+        if (url.find("dataset.stac.json") != std::string::npos)
+          return std::vector<unsigned char>(wave_item.begin(), wave_item.end());
+        if (url.find("/VHM0/0.0.0") != std::string::npos) return height_chunk;
+        if (url.find("/VTPK/0.0.0") != std::string::npos) return period_chunk;
+        if (url.find("/VMDR/0.0.0") != std::string::npos)
+          return direction_chunk;
+        throw std::runtime_error("unexpected mocked wave URL: " + url);
+      },
+      [](const std::string&, const std::string&, double) { return true; });
+  Check(remote_waves.message_count == 3 &&
+            eg::InspectGrib(remote_wave_output)["short_name_counts"]["dirpw"]
+                    .asUInt64() == 1,
+        "Copernicus Global packed wave ARCO conversion accepts a bounded "
+        "off-cycle start");
+  eg::EnvironmentResult wave_size_result;
+  wave_size_result.output = remote_wave_output;
+  wave_size_result.inspection = remote_waves.inspection;
+  wave_size_result.message_count = remote_waves.message_count;
+  wave_size_result.byte_count = remote_waves.byte_count;
+  const auto wave_size_report = eg::BuildSizeComparison(
+      wave_size_request, wave_size_estimate, wave_size_result);
+  Check(wave_size_report["numericStatus"].asString() == "exact" &&
+        wave_size_report["fileStatus"].asString() == "within_upper_estimate",
+        "pre-generation wave estimate matches mocked provider conversion");
+#ifdef ENVIRONMENTAL_GRIB_HAVE_PROJ
+  const auto ukv_pressure = Temp("ukv-pressure.nc");
+  const auto ukv_temperature = Temp("ukv-temperature.nc");
+  const auto ukv_speed = Temp("ukv-speed.nc");
+  const auto ukv_direction = Temp("ukv-direction.nc");
+  const auto ukv_output = Temp("ukv.grb2");
+  WriteUkvFixture(ukv_pressure, "pressure_at_mean_sea_level",
+                  "air_pressure_at_mean_sea_level", "Pa", 101500.0);
+  WriteUkvFixture(ukv_temperature, "temperature_at_screen_level",
+                  "air_temperature", "K", 285.0);
+  WriteUkvFixture(ukv_speed, "wind_speed_at_10m", "wind_speed", "m s-1", 10.0);
+  WriteUkvFixture(ukv_direction, "wind_direction_at_10m", "wind_from_direction",
+                  "degree", 270.0);
+  auto bytes_from = [](const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary | std::ios::ate);
+    std::vector<unsigned char> bytes(static_cast<std::size_t>(input.tellg()));
+    input.seekg(0);
+    input.read(reinterpret_cast<char*>(bytes.data()),
+               static_cast<std::streamsize>(bytes.size()));
+    return bytes;
+  };
+  eg::UkvRequest ukv_request;
+  // Exercise a regional request which only partly overlaps the projected
+  // fixture, matching the bitmap behavior used by live UKV and MET Norway.
+  ukv_request.bbox = {-12.0, 48.0, 4.0, 62.0};
+  ukv_request.output = ukv_output;
+  ukv_request.hours = 1;
+  ukv_request.cycle = "00";
+  ukv_request.date = "20260703";
+  ukv_request.grid_spacing_deg = 0.1;
+  ukv_request.overwrite = true;
+  const auto ukv =
+      eg::GenerateUkv(ukv_request, [&](const std::string& url, double) {
+        if (url.find("pressure_at_mean_sea_level") != std::string::npos)
+          return bytes_from(ukv_pressure);
+        if (url.find("temperature_at_screen_level") != std::string::npos)
+          return bytes_from(ukv_temperature);
+        if (url.find("wind_speed_at_10m") != std::string::npos)
+          return bytes_from(ukv_speed);
+        if (url.find("wind_direction_at_10m") != std::string::npos)
+          return bytes_from(ukv_direction);
+        throw std::runtime_error("unexpected UKV URL");
+      });
+  const auto ukv_inspection = eg::InspectGrib(ukv_output);
+  Check(
+      ukv.message_count == 8 &&
+          ukv_inspection["short_name_counts"]["10u"].asUInt64() == 2 &&
+          ukv_inspection["messages"][0]["values"]["missing_count"].asUInt64() >
+              0 &&
+          std::stoull(ukv.variables_levels.at("partial_field_count")) == 8 &&
+          std::stod(ukv.variables_levels.at("maximum_missing_percent")) > 0.5 &&
+          ukv.variables_levels.at("regrid_plan_count") == "1" &&
+          std::stoull(ukv.variables_levels.at("regrid_workers")) > 0 &&
+          std::stod(ukv.variables_levels.at("timing_total_seconds")) >= 0.0,
+      "UKV projected NetCDF regrid and meteorological wind conversion");
+  const auto metno_source = Temp("metno.nc");
+  const auto metno_output = Temp("metno.grb2");
+  WriteMetNoFixture(metno_source);
+  eg::MetNoRequest metno_request;
+  // This regular-lat/lon rectangle crosses the north and south edges of the
+  // projected fixture. The covered cells must be retained using GRIB bitmaps.
+  metno_request.bbox = {10.0, 60.0, 20.0, 66.0};
+  metno_request.output = metno_output;
+  // Six hourly records cross the four-time conversion batch boundary.
+  metno_request.hours = 5;
+  metno_request.step_hours = 1;
+  metno_request.preset = "all";
+  metno_request.grid_spacing_deg = 0.25;
+  metno_request.dataset_url = eg::PathToUtf8(metno_source);
+  metno_request.overwrite = true;
+  const auto metno_cache = Temp("metno-cache");
+  std::filesystem::remove_all(metno_cache);
+  metno_request.cache_directory = metno_cache;
+  const auto metno = eg::GenerateMetNoNordic(metno_request);
+  const auto metno_inspection = eg::InspectGrib(metno_output);
+  bool metno_precipitation_interval = false;
+  bool metno_partial_temperature = false;
+  for (const auto& message : metno_inspection["messages"]) {
+    if (message["parameter_category"].asInt() == 1 &&
+        message["parameter_number"].asInt() == 8) {
+      metno_precipitation_interval =
+          metno_precipitation_interval ||
+          (message["product_definition_template"].asInt() == 8 &&
+           message["step_type"].asString() == "accum" &&
+           message["end_step"].asInt() - message["start_step"].asInt() == 1);
+    }
+    if (message["short_name"].asString() == "2t" &&
+        message["values"]["missing_count"].asUInt64() > 0 &&
+        message["values"]["missing_count"].asUInt64() <
+            message["values"]["count"].asUInt64())
+      metno_partial_temperature = true;
+  }
+  const bool metno_ok =
+      metno.message_count == 47 &&
+      metno_inspection["short_name_counts"]["10u"].asUInt64() == 6 &&
+      metno_inspection["grib2_parameter_counts"]["0:1:8"].asUInt64() == 5 &&
+      metno_inspection["grib2_parameter_counts"]["0:1:1"].asUInt64() == 6 &&
+      metno_precipitation_interval && metno_partial_temperature &&
+      std::stoull(metno.variables_levels.at("partial_field_count")) == 47 &&
+      std::stod(metno.variables_levels.at("maximum_missing_percent")) > 0.5 &&
+      metno.variables_levels.at("time_batch_size") == "4" &&
+      metno.variables_levels.at("source_read_strategy") ==
+          "strided-local-batch" &&
+      metno.variables_levels.at("remote_read_requests") == "16" &&
+      metno.variables_levels.at("source_field_slices") == "47" &&
+      metno.variables_levels.at("cache_hit") == "false" &&
+      metno.variables_levels.at("cache_saved") == "true" &&
+      std::stoull(metno.variables_levels.at("regrid_plan_cells")) > 0 &&
+      std::stoull(metno.variables_levels.at("regrid_workers")) > 0 &&
+      std::stod(metno.variables_levels.at("timing_total_seconds")) >= 0.0;
+  if (!metno_ok) {
+    std::cerr << "MET Norway messages=" << metno.message_count
+              << " counts=" << metno_inspection["short_name_counts"]
+              << " metadata=";
+    for (const auto& [key, value] : metno.variables_levels)
+      std::cerr << key << '=' << value << ' ';
+    std::cerr << '\n';
+  }
+  Check(metno_ok, "MET Norway local NetCDF all-fields conversion");
+  const auto metno_cached_output = Temp("metno-cached.grb2");
+  metno_request.output = metno_cached_output;
+  const auto metno_cached = eg::GenerateMetNoNordic(metno_request);
+  Check(metno_cached.variables_levels.at("cache_hit") == "true" &&
+            metno_cached.message_count == metno.message_count &&
+            bytes_from(metno_cached_output) == bytes_from(metno_output),
+        "MET Norway completed-cycle cache is validated and byte-identical");
+  for (const auto& entry : std::filesystem::directory_iterator(metno_cache))
+    if (entry.path().extension() == ".grb2")
+      std::filesystem::resize_file(
+          entry.path(), std::filesystem::file_size(entry.path()) - 1);
+  const auto metno_recovered_output = Temp("metno-cache-recovered.grb2");
+  metno_request.output = metno_recovered_output;
+  const auto metno_recovered = eg::GenerateMetNoNordic(metno_request);
+  Check(metno_recovered.variables_levels.at("cache_hit") == "false" &&
+            metno_recovered.variables_levels.at("cache_saved") == "true" &&
+            bytes_from(metno_recovered_output) == bytes_from(metno_output),
+        "MET Norway corrupt cache is rejected and rebuilt without data loss");
+  const auto metno_current = Temp("metno-current.grb");
+  const auto metno_environment = Temp("metno-environment.grb2");
+  const auto metno_grid =
+      eg::BuildRegularGrid(metno_request.bbox, metno_request.grid_spacing_deg);
+  eg::CurrentGrid metno_current_0{eg::ParseUtcDateTime("2026-07-27T00:00:00Z"),
+                                  metno_grid,
+                                  std::vector<double>(metno_grid.size(), 0.2),
+                                  std::vector<double>(metno_grid.size(), -0.1),
+                                  {}};
+  eg::CurrentGrid metno_current_1 = metno_current_0;
+  metno_current_1.time += std::chrono::hours(1);
+  eg::WriteGrib1Currents({metno_current_0, metno_current_1}, metno_current);
+  eg::EnvironmentRequest metno_combined;
+  metno_combined.bbox = metno_request.bbox;
+  metno_combined.start = metno_current_0.time;
+  metno_combined.hours = 5;
+  metno_combined.step_hours = 1;
+  metno_combined.weather_provider = "metno_nordic";
+  metno_combined.weather_preset = "all";
+  metno_combined.weather_grid_spacing_deg = 0.25;
+  metno_combined.metno_dataset_url = eg::PathToUtf8(metno_source);
+  metno_combined.current_source = "existing-file";
+  metno_combined.current_file = metno_current;
+  metno_combined.output = metno_environment;
+  metno_combined.overwrite = true;
+  const auto metno_combined_result = eg::GenerateEnvironment(metno_combined);
+  const bool metno_combined_ok =
+      metno_combined_result.message_count == 51 &&
+      metno_combined_result.inspection["current_component_counts"]["u_49"]
+              .asUInt64() == 2 &&
+      metno_combined_result.inspection["grib2_parameter_counts"]["0:6:1"]
+              .asUInt64() == 6;
+  if (!metno_combined_ok)
+    std::cerr
+        << "MET Norway combined messages="
+        << metno_combined_result.message_count << " current="
+        << metno_combined_result.inspection["current_component_counts"]["u_49"]
+        << " cloud="
+        << metno_combined_result.inspection["grib2_parameter_counts"]["0:6:1"]
+        << '\n';
+  Check(metno_combined_ok,
+        "MET Norway all-fields weather combines with an independent current "
+        "provider");
+#endif
+  const auto environment_path = Temp("environment.grb");
+  eg::EnvironmentRequest environment;
+  environment.bbox = {-8.5, 50.5, -2.5, 56.5};
+  environment.start = start;
+  environment.hours = 6;
+  environment.step_hours = 3;
+  environment.cycle = "00";
+  environment.date = "20260701";
+  environment.weather_provider = "gfs";
+  environment.current_source = "existing-file";
+  environment.current_file = current_path;
+  environment.output = environment_path;
+  environment.overwrite = true;
+  const auto environment_result = eg::GenerateEnvironment(
+      environment,
+      [&](const std::string&, double) { return weather_downloaded; });
+  Check(environment_result.message_count == 8 &&
+            environment_result.current_source == "existing-file" &&
+            environment_result.selected_cycle == "20260701T0000Z",
+        "combined environment orchestration and deterministic merge");
+
+  const auto hourly_resume_path = Temp("hourly-resume-environment.grb");
+  eg::EnvironmentRequest hourly_resume = environment;
+  hourly_resume.output = hourly_resume_path;
+  hourly_resume.hours = 1;
+  hourly_resume.step_hours = 1;
+  hourly_resume.current_source = "marine_ie_irish_sea";
+  hourly_resume.current_file.reset();
+  std::atomic<int> first_weather_requests{0};
+  bool first_failed = false;
+  try {
+    eg::GenerateEnvironment(
+        hourly_resume,
+        [&](const std::string& url, double) -> std::vector<unsigned char> {
+          if (url.rfind("ftp://", 0) == 0)
+            throw eg::HttpDownloadError("simulated current outage", false);
+          ++first_weather_requests;
+          return weather_downloaded;
+        });
+  } catch (const eg::ValidationError&) {
+    first_failed = true;
+  }
+  Check(first_failed && first_weather_requests.load() == 2,
+        "hourly environment failure occurs after completed weather stage");
+  std::atomic<int> resumed_weather_requests{0};
+  bool reused_weather = false;
+  const auto resumed_environment = eg::GenerateEnvironment(
+      hourly_resume,
+      [&](const std::string& url, double) {
+        if (url.rfind("ftp://", 0) == 0) return downloaded;
+        ++resumed_weather_requests;
+        return weather_downloaded;
+      },
+      std::nullopt,
+      [&](const std::string& stage, const Json::Value&) {
+        if (stage == "reusing completed weather") reused_weather = true;
+      });
+  Check(resumed_weather_requests.load() == 0 && reused_weather &&
+            resumed_environment.selected_cycle == "20260701T0000Z" &&
+            resumed_environment.message_count == 6,
+        "validated hourly weather checkpoint resumes without redownload");
+
+  const auto coupled_resume_path = Temp("coupled-gfs-resume.grb");
+  eg::EnvironmentRequest coupled_resume = hourly_resume;
+  coupled_resume.output = coupled_resume_path;
+  coupled_resume.hours = 0;
+  coupled_resume.include_waves = true;
+  coupled_resume.wave_provider = "gfs_wave";
+  coupled_resume.wave_step_hours = 1;
+  std::atomic<int> first_coupled_requests{0};
+  try {
+    eg::GenerateEnvironment(
+        coupled_resume,
+        [&](const std::string& url, double) -> std::vector<unsigned char> {
+          if (url.rfind("ftp://", 0) == 0)
+            throw eg::HttpDownloadError("simulated current outage", false);
+          ++first_coupled_requests;
+          return url.find("wave") != std::string::npos ? wave_downloaded
+                                                       : weather_downloaded;
+        });
+  } catch (const eg::ValidationError&) {
+  }
+  std::atomic<int> resumed_coupled_requests{0};
+  const auto resumed_coupled = eg::GenerateEnvironment(
+      coupled_resume, [&](const std::string& url, double) {
+        if (url.rfind("ftp://", 0) == 0) return downloaded;
+        ++resumed_coupled_requests;
+        return url.find("wave") != std::string::npos ? wave_downloaded
+                                                     : weather_downloaded;
+      });
+  Check(first_coupled_requests.load() == 2 &&
+            resumed_coupled_requests.load() == 0 &&
+            resumed_coupled.message_count == 6,
+        "coupled GFS atmosphere/wave checkpoints resume as a matched cycle");
+  const auto merged_path = Temp("merged.grb");
+  const auto merged = eg::MergeGribStreams(
+      {{"a", current_path}, {"b", current_path}}, merged_path, true);
+  Check(merged.output_message_count == 4, "atomic stream merge");
+  const auto composite_path = Temp("composite.grb");
+  const auto composite = eg::CompositeGribStreamsPreferFirst(
+      {{"preferred", current_path}, {"fallback", current_path}}, composite_path,
+      true);
+  Check(composite.input_message_counts.at("preferred") == 2 &&
+            composite.input_message_counts.at("fallback") == 2,
+        "forecast composite counts both source streams");
+  Check(composite.output_message_count == 2,
+        "forecast composite deterministically keeps preferred duplicates " +
+            std::to_string(composite.output_message_count));
+  auto later_current = constant;
+  later_current.time = start + std::chrono::hours(3);
+  const auto ranged_input_path = Temp("ranged-input.grb");
+  eg::WriteGrib1Currents({constant, later_current}, ranged_input_path);
+  const auto ranged_output_path = Temp("ranged-output.grb");
+  const auto ranged = eg::CompositeGribStreamsPreferFirst(
+      {{"current", ranged_input_path}}, ranged_output_path, true, std::nullopt,
+      start);
+  Check(
+      ranged.output_message_count == 2 &&
+          ranged.inspection["first_valid_time"].asString() == "20260701T0000" &&
+          ranged.inspection["last_valid_time"].asString() == "20260701T0000",
+      "forecast composite removes every component beyond the requested UTC "
+      "end");
+
+  eg::EnvironmentRequest extension_plan;
+  extension_plan.bbox = {-8.5, 50.5, -2.5, 56.5};
+  extension_plan.start = start;
+  extension_plan.hours = 360;
+  extension_plan.step_hours = 1;
+  extension_plan.weather_provider = "ukmo_ukv";
+  extension_plan.extend_forecast = true;
+  extension_plan.fallback_weather_provider = "gfs";
+  extension_plan.current_source = "none";
+  extension_plan.output = Temp("extension-plan.grb");
+  extension_plan.overwrite = true;
+  extension_plan.dry_run = true;
+  const auto planned_extension = eg::GenerateEnvironment(extension_plan);
+  const auto planned_weather =
+      planned_extension
+          .diagnostics["forecast_extension"]["coverage"]["weather"];
+  Check(planned_weather.size() == 2 &&
+            planned_weather[0]["source"].asString() == "ukmo_ukv" &&
+            planned_weather[0]["through_hour"].asInt() == 120 &&
+            planned_weather[1]["source"].asString() == "gfs" &&
+            planned_weather[1]["through_hour"].asInt() == 360 &&
+            planned_weather[1]["model_lead_hours_requested"].asInt() == 384,
+        "15-day extension pads GFS model leads while targeting hour 360");
+  eg::EnvironmentRequest nws_extension_plan = extension_plan;
+  nws_extension_plan.weather_provider = "none";
+  nws_extension_plan.fallback_weather_provider = "none";
+  nws_extension_plan.current_source = "copernicus_nws";
+  nws_extension_plan.fallback_current_source = "offline-tidal";
+  nws_extension_plan.output = Temp("nws-extension-plan.grb");
+  const auto planned_currents =
+      eg::GenerateEnvironment(nws_extension_plan)
+          .diagnostics["forecast_extension"]["coverage"]["current"];
+  Check(planned_currents.size() == 2 &&
+            planned_currents[0]["source"].asString() == "copernicus_nws" &&
+            planned_currents[0]["through_hour"].asInt() == 168 &&
+            planned_currents[1]["source"].asString() == "offline-tidal" &&
+            planned_currents[1]["through_hour"].asInt() == 360,
+        "15-day current extension uses the published seven-day NWS horizon "
+        "and an offline tail");
+
+  eg::EnvironmentRequest short_cycle_plan = extension_plan;
+  short_cycle_plan.hours = 72;
+  short_cycle_plan.output = Temp("short-cycle-plan.grb");
+  const auto short_cycle_weather =
+      eg::GenerateEnvironment(short_cycle_plan)
+          .diagnostics["forecast_extension"]["coverage"]["weather"];
+  Check(short_cycle_weather.size() == 1 &&
+            short_cycle_weather[0]["source"].asString() == "ukmo_ukv" &&
+            short_cycle_weather[0]["model_lead_hours_requested"].asInt() == 96,
+        "72-hour UTC window requests enough UKV lead time for an older cycle");
+
+  eg::EnvironmentRequest partial_weather;
+  partial_weather.bbox = {-8.5, 50.5, -2.5, 56.5};
+  partial_weather.start = start;
+  partial_weather.hours = 3;
+  partial_weather.step_hours = 3;
+  partial_weather.weather_provider = "existing-file";
+  partial_weather.weather_file = grib2_path;
+  partial_weather.extend_forecast = true;
+  partial_weather.current_source = "none";
+  partial_weather.output = Temp("partial-weather-rejected.grb");
+  partial_weather.overwrite = true;
+  bool partial_rejected = false;
+  try {
+    eg::GenerateEnvironment(partial_weather);
+  } catch (const eg::ValidationError& error) {
+    partial_rejected = std::string(error.what())
+                           .find("does not cover the requested UTC window") !=
+                       std::string::npos;
+  }
+  Check(partial_rejected,
+        "extension refuses a GRIB whose weather would end before currents");
+
+  eg::EnvironmentRequest recovered_extension = extension_plan;
+  recovered_extension.hours = 0;
+  recovered_extension.weather_provider = "unavailable-test-provider";
+  recovered_extension.output = Temp("recovered-extension.grb");
+  recovered_extension.dry_run = false;
+  const auto recovered = eg::GenerateEnvironment(
+      recovered_extension,
+      [&](const std::string&, double) { return weather_downloaded; });
+  const auto recovered_weather =
+      recovered.diagnostics["forecast_extension"]["coverage"]["weather"];
+  Check(recovered.message_count > 0 && recovered_weather.size() == 2 &&
+            recovered_weather[0]["status"].asString() == "failed" &&
+            recovered_weather[1]["source"].asString() == "gfs" &&
+            recovered_weather[1]["status"].asString() == "complete",
+        "selected long-range weather recovers a failed preferred provider");
+
+  const auto unicode_directory =
+      Temp("unicode") / std::filesystem::path(u8"navigation-航海");
+  std::filesystem::create_directories(unicode_directory);
+  const auto netcdf_path = unicode_directory / u8"currents-åäö.nc";
+  WriteNetCDFFixture(netcdf_path, "cm/s");
+  eg::NetCDFCurrentSource netcdf(netcdf_path);
+  const eg::BoundingBox netcdf_bbox{-7.0, 51.5, -6.0, 52.5};
+  const auto netcdf_grid = eg::BuildRegularGrid(netcdf_bbox, 0.5);
+  const auto netcdf_current =
+      netcdf.GetCurrentGrid(netcdf_bbox, start, netcdf_grid);
+  Check(netcdf_current.u_mps.size() == 9 &&
+            Near(netcdf_current.u_mps.front(), 0.01) &&
+            Near(netcdf_current.v_mps.back(), 0.02),
+        "NetCDF detection and cm/s conversion");
+  const auto source_grid = netcdf.BuildSourceGrid(netcdf_bbox);
+  Check(source_grid.nx() == 3 && source_grid.ny() == 3 &&
+            Near(source_grid.spacing_deg, 0.5),
+        "NetCDF native source grid");
+  const auto netcdf_inspection = netcdf.Inspect();
+  Check(netcdf_inspection["detected_u_variable"].asString() ==
+            "eastward_sea_water_velocity",
+        "NetCDF inspection detects u variable");
+  const auto wave_netcdf = Temp("waves.nc");
+  const auto wave_grib = Temp("waves.grb2");
+  WriteWaveFixture(wave_netcdf);
+  const auto converted_waves = eg::ConvertCopernicusWaveNetCDF(
+      wave_netcdf, netcdf_bbox, start, 3, 3, wave_grib, 0.5, true);
+  Check(
+      converted_waves.message_count == 6 &&
+          converted_waves.inspection["short_name_counts"]["swh"].asUInt64() ==
+              2 &&
+          converted_waves.inspection["short_name_counts"]["dirpw"].asUInt64() ==
+              2,
+      "Copernicus wave NetCDF conversion");
+
+  const auto wave_only_path = Temp("wave-only-environment.grb");
+  eg::EnvironmentRequest wave_only;
+  wave_only.bbox = netcdf_bbox;
+  wave_only.start = start;
+  wave_only.hours = 0;
+  wave_only.step_hours = 1;
+  wave_only.wave_step_hours = 1;
+  wave_only.cycle = "00";
+  wave_only.date = "20260701";
+  wave_only.weather_provider = "none";
+  wave_only.include_waves = true;
+  wave_only.wave_provider = "gfs_wave";
+  wave_only.current_source = "none";
+  wave_only.output = wave_only_path;
+  wave_only.overwrite = true;
+  const auto wave_only_result = eg::GenerateEnvironment(
+      wave_only,
+      [&](const std::string&, double) { return bytes_from(wave_grib); });
+  Check(wave_only_result.message_count == 6 &&
+            wave_only_result.inputs.size() == 1 &&
+            wave_only_result.wave_provider == "gfs_wave",
+        "wave generation remains independent of weather selection");
+
+  for (const auto& path : {minimal,
+                           wrapped,
+                           clean,
+                           current_path,
+                           weather_fixture,
+                           wave_fixture,
+                           grib2_path,
+                           merged_path,
+                           composite_path,
+                           recovered_extension.output,
+                           netcdf_path,
+                           wave_netcdf,
+                           wave_grib,
+                           wave_only_path,
+                           weather_path,
+                           readiness_request.output,
+                           indexed_wave_request.output,
+                           icon_path,
+                           hrrr_path,
+                           ecmwf_path,
+                           marine_path,
+                           rtofs_source,
+                           rtofs_output,
+                           copernicus_output,
+                           global_current_output,
+                           remote_wave_output,
+                           environment_path,
+                           hourly_resume_path,
+                           coupled_resume_path}) {
+    std::error_code ignored;
+    std::filesystem::remove(path, ignored);
+  }
+  {
+    std::error_code ignored;
+    std::filesystem::remove_all(Temp("unicode"), ignored);
+  }
+#ifdef ENVIRONMENTAL_GRIB_HAVE_PROJ
+  for (const auto& path :
+       {ukv_pressure, ukv_temperature, ukv_speed, ukv_direction, ukv_output,
+        metno_source, metno_output, metno_current, metno_environment}) {
+    std::error_code ignored;
+    std::filesystem::remove(path, ignored);
+  }
+#endif
+  std::cout << "environmental_grib_tests failures=" << failures << '\n';
+  return failures == 0 ? 0 : 1;
+}

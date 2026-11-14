@@ -35,10 +35,13 @@
 struct RouteMapConfiguration;
 class RoutePoint;
 struct climatology_wind_atlas;
+namespace weather_routing { class PassageWeather; }
 
 class WeatherDataProvider {
 public:
   virtual ~WeatherDataProvider() = default;
+  static void SetInternalForecast(std::shared_ptr<weather_routing::PassageWeather>);
+  static std::shared_ptr<weather_routing::PassageWeather> InternalForecast();
 
   /**
    * Initialize configured climatology services before route workers start.

@@ -1,0 +1,151 @@
+#pragma once
+
+#include <cstddef>
+#include <filesystem>
+#include <map>
+#include <optional>
+#include <span>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <json/json.h>
+
+#include "environmental_grib/model.h"
+
+namespace environmental_grib {
+
+struct GribScanResult {
+  std::size_t message_count{};
+  std::size_t byte_count{};
+};
+
+struct GribNormalizeResult {
+  std::size_t message_count{};
+  std::size_t raw_byte_count{};
+  std::size_t clean_byte_count{};
+  std::size_t skipped_byte_count{};
+};
+
+struct GribWriteSummary {
+  std::size_t message_count{};
+  std::filesystem::path output;
+};
+
+struct Grib2Field {
+  int forecast_hour{};
+  std::string short_name;
+  std::vector<double> values;
+  std::vector<std::uint8_t> mask;
+  // Leave these unset to retain the level implied by the ecCodes short name
+  // (for example 10u and 2t).  NetCDF-backed providers use them for fields
+  // such as pressure-level wind and 2 m relative humidity.
+  std::optional<std::string> type_of_level;
+  std::optional<double> level;
+  // Interval fields are valid at forecast_hour and cover the preceding
+  // interval_hours. Supported step types include "accum" and "max".
+  std::optional<std::string> step_type;
+  int interval_hours{};
+};
+
+struct MergeStreamsResult {
+  std::map<std::string, std::size_t> input_message_counts;
+  std::size_t output_message_count{};
+  std::size_t byte_count{};
+  Json::Value inspection;
+};
+
+/** Inputs accepted by the user-facing environmental merge operation.
+ *
+ * Weather and current inputs are independently optional so the same
+ * production path also handles weather-only and current-only files.  At
+ * least one input must be supplied.
+ */
+struct EnvironmentalMergeRequest {
+  std::optional<std::filesystem::path> weather;
+  std::optional<std::filesystem::path> current;
+  std::optional<std::filesystem::path> waves;
+  std::filesystem::path output;
+  bool overwrite{};
+};
+
+/** Structured result from validating and merging environmental GRIBs.
+ *
+ * Validation failures are returned in errors rather than thrown.  This lets
+ * both the GUI and headless validation tools report the same production
+ * diagnostics without implementing a second merge algorithm.
+ */
+struct EnvironmentalMergeResult {
+  bool success{};
+  std::filesystem::path output;
+  std::map<std::string, std::size_t> input_message_counts;
+  std::size_t output_message_count{};
+  std::size_t byte_count{};
+  Json::Value input_validation{Json::objectValue};
+  Json::Value output_inspection{Json::objectValue};
+  std::vector<std::string> fields_discovered;
+  std::vector<std::string> time_records_discovered;
+  std::vector<std::string> fields_written;
+  std::vector<std::string> warnings;
+  std::vector<std::string> errors;
+};
+
+GribScanResult ScanGribMessages(const std::filesystem::path& path);
+GribScanResult ScanGribBytes(std::span<const unsigned char> data);
+GribNormalizeResult NormalizeGribStream(const std::filesystem::path& input,
+                                        const std::filesystem::path& output);
+/** Decode GRIB2 messages with ecCodes and repack them using simple packing.
+ *
+ * This normalises provider-specific encodings such as ECMWF CCSDS/AEC
+ * (template 5.42) into a representation supported by xGRIB's in-process
+ * reader while preserving the meteorological metadata.
+ */
+GribWriteSummary RepackGrib2ToSimplePacking(
+    const std::filesystem::path& input,
+    const std::filesystem::path& output);
+std::size_t FilterGribTimes(const std::filesystem::path& input,
+                     const std::filesystem::path& output,
+                     TimePoint from, TimePoint through,
+                     const std::set<TimePoint>& selected = {});
+Json::Value InspectGrib(const std::filesystem::path& path);
+/** Crop and spatially stitch matching regular-lat/lon records. Fragments must
+ * share forecast identity and grid geometry. Coordinates/data are reordered
+ * together, masks are preserved, and gaps/conflicting overlaps are rejected.
+ * Output contains one continuous message per field/time, not two halves.
+ */
+GribWriteSummary CropAndStitchGrib(
+    const std::vector<std::filesystem::path>& inputs, const BoundingBox& bbox,
+    const std::filesystem::path& output, bool east_inclusive = true);
+GribWriteSummary WriteGrib1Currents(const std::vector<CurrentGrid>& grids,
+                                    const std::filesystem::path& output);
+GribWriteSummary WriteRegularLatLonGrib2(const RegularGrid& grid,
+                                         TimePoint reference,
+                                         const std::vector<Grib2Field>& fields,
+                                         const std::filesystem::path& output);
+/** Encode one ordered chunk of a regular-lat/lon GRIB2 stream.
+ *
+ * The first chunk must use append=false; subsequent chunks use append=true.
+ * Unlike WriteRegularLatLonGrib2 this deliberately does not rescan the whole
+ * output after every chunk. The caller validates the completed stream once.
+ */
+GribWriteSummary WriteRegularLatLonGrib2Chunk(
+    const RegularGrid& grid, TimePoint reference,
+    const std::vector<Grib2Field>& fields, const std::filesystem::path& output,
+    bool append);
+MergeStreamsResult MergeGribStreams(
+    const std::vector<std::pair<std::string, std::filesystem::path>>& inputs,
+    const std::filesystem::path& output, bool overwrite = false);
+EnvironmentalMergeResult MergeEnvironmentalGribs(
+    const EnvironmentalMergeRequest& request);
+Json::Value EnvironmentalMergeResultJson(
+    const EnvironmentalMergeResult& result);
+/** Merge GRIBs in priority order, retaining the first message for each
+ * parameter/level/valid-time tuple. */
+MergeStreamsResult CompositeGribStreamsPreferFirst(
+    const std::vector<std::pair<std::string, std::filesystem::path>>& inputs,
+    const std::filesystem::path& output, bool overwrite = false,
+    std::optional<TimePoint> valid_from = std::nullopt,
+    std::optional<TimePoint> valid_through = std::nullopt);
+
+}  // namespace environmental_grib

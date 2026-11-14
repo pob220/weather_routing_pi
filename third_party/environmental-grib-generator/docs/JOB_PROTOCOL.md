@@ -1,0 +1,99 @@
+# Native helper job protocol
+
+The OpenCPN plugin invokes `environmental-grib` as a separate native helper.
+This keeps provider and format dependencies outside the OpenCPN process. The
+protocol is versioned independently of the command-line convenience commands.
+
+## Invocation
+
+```sh
+environmental-grib run-job --job request.json --result result.json
+```
+
+The result file is written atomically. It is first created with `status` set to
+`running`, then replaced with a `complete` or `failed` result. Standard output
+contains one compact JSON object per line. Event types are `started`,
+`progress`, `complete`, and `failed`.
+
+Copernicus sign-in and account-verification failures use
+`error.code: copernicus_authentication_failed`. The message describes recognised
+service reasons and retains HTTP status where available, without exposing raw
+authentication responses. Area validation runs before authentication.
+
+## Request schema version 1
+
+```json
+{
+  "schemaVersion": 1,
+  "operation": "generateEnvironment",
+  "request": {
+    "bbox": {"west": -8.5, "south": 50.5, "east": -2.5, "north": 56.5},
+    "start": "2026-07-12T00:00:00Z",
+    "hours": 72,
+    "stepHours": 3,
+    "weatherProvider": "metno_nordic",
+    "extendForecast": true,
+    "fallbackWeatherProvider": "gfs",
+    "fallbackWaveProvider": "gfs_wave",
+    "fallbackCurrentSource": "offline-tidal",
+    "weatherPreset": "all",
+    "includeWaves": true,
+    "waveProvider": "gfs_wave",
+    "currentSource": "tpxo-cache",
+    "inputCache": "/path/to/cache.tpxocache",
+    "tpxoModelDirectory": "/path/to/tide-models",
+    "autoPrepareTpxoCache": true,
+    "output": "/path/to/environment.grb",
+    "overwrite": true
+  },
+  "credentials": {
+    "copernicusPasswordEnvironment": "ENVIRONMENTAL_GRIB_COPERNICUS_PASSWORD"
+  }
+}
+```
+
+Passwords must never be placed in a job file. The named environment variable
+is read by the helper after validating the schema.
+
+Starting with helper 0.3.2 (xGRIB 0.3.7), bbox longitudes remain in `[-180, 180]`
+and `west > east` selects an eastward interval across the date line. Thus
+`west=170, east=-170` spans 20 degrees. Equal endpoints are invalid; the full
+world is `west=-180, east=180`. Output regular grids use continuous longitude
+columns and serialize endpoints according to GRIB conventions. Sources must
+cover the requested interval; crossing does not expand regional coverage.
+The `capabilities` result advertises `antimeridianBoundingBoxes: true`.
+
+Implemented generated-weather provider IDs are `gfs`, `noaa_hrrr`,
+`ukmo_ukv`, `metno_nordic`, `dwd_icon_eu`, `ecmwf_ifs_open`, and
+`ecmwf_aifs_open`. Weather presets are `minimal`, `routing`, `marine`, and
+`all`. `all` is provider-aware and requests every field that xGRIB can display
+from the selected provider; it does not imply waves or currents, which remain
+independent request components.
+
+The forecast-extension fields are optional and default to disabled/`none` for
+backward compatibility. When enabled, component generators use known provider
+horizons and native cadences, then composite messages by parameter, level and
+valid time. The preferred input is retained when preferred and fallback inputs
+contain the same message tuple. The result `diagnostics.forecast_extension`
+object records planned/completed/failed coverage for each component.
+
+`hours` is measured from the absolute `start` time, not independently from each
+provider's model cycle. For cycle-based weather and wave products the generator
+requests sufficient additional model lead time, verifies decoded valid-time
+coverage, and removes records beyond `start + hours` from the final composite.
+Generation fails instead of publishing a partial component when neither the
+preferred source nor its selected fallback covers the requested UTC end.
+
+## Discovery and compatibility
+
+`environmental-grib capabilities` reports the job schema, helper version,
+progress protocol, and implemented providers. Unknown schema versions,
+operations, options, and malformed values are rejected before generation.
+## Optional size comparison (additive v1 field)
+
+Successful non-dry-run `run-job` results may include `result.size_comparison`.
+Its schemaVersion 1 object contains a credential-free, size-relevant `request`,
+the pre-generation `estimate`, final `actual` counts, and `numericStatus` /
+`fileStatus`. `actual.decodedBytes` is present only when `numericComplete` is
+true. Older clients can ignore this field and newer clients must accept its
+absence. See `estimates.md` for coverage, privacy and RAM limitations.

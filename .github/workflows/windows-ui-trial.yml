@@ -1,0 +1,91 @@
+name: Windows UI trial
+
+on:
+  workflow_dispatch:
+    inputs:
+      qualification-run:
+        type: string
+        required: true
+      source-commit:
+        type: string
+        required: true
+  workflow_call:
+    inputs:
+      qualification-run:
+        type: string
+        required: true
+      source-commit:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: windows-ui-trial-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  trial:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # A manual rerun may fix test automation while keeping the qualified
+          # product inputs and packaged native binaries exactly unchanged.
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.sha || inputs.source-commit }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify unchanged qualified product inputs
+        env:
+          QUALIFIED_SOURCE_COMMIT: ${{ inputs.source-commit }}
+        shell: python
+        run: |
+          import os, re, subprocess
+          source = os.environ['QUALIFIED_SOURCE_COMMIT']
+          if not re.fullmatch(r'[0-9a-f]{40}', source):
+              raise ValueError('Expected the full qualified source commit')
+          subprocess.run(['git', 'diff', '--exit-code', source, 'HEAD', '--', '.',
+              ':(exclude).github/workflows/windows-ui-trial.yml',
+              ':(exclude)tools/test-windows-ui-trial.py'], check=True)
+      - name: Download already-qualified Windows binaries
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ inputs.qualification-run }}
+          name: xWeatherRouting-2.2.0-windows-x64-wx3.3.4
+          path: artifacts/qualified
+      - name: Package matching host, plugin and portable launcher
+        shell: pwsh
+        run: |
+          $plugins = @(Get-ChildItem artifacts/qualified -Recurse -Filter '*-wx334.tar.gz')
+          if ($plugins.Count -ne 1) { throw 'Expected one qualified wx334 archive' }
+          $plugin = $plugins[0]
+          python tools/make-windows-ui-trial.py --plugin $plugin.FullName --source-commit "${{ inputs.source-commit }}" --qualification-run "${{ inputs.qualification-run }}" --output artifacts/trial/xWeatherRouting-2.2.0-Windows-UI-Trial.zip
+          if ($LASTEXITCODE -ne 0) { throw 'UI trial packaging failed' }
+      - name: Test delivered launcher and relocated portable host
+        shell: pwsh
+        run: |
+          $plugins = @(Get-ChildItem artifacts/qualified -Recurse -Filter '*-wx334.tar.gz')
+          if ($plugins.Count -ne 1) { throw 'Expected one qualified wx334 archive' }
+          $plugin = $plugins[0]
+          python tools/test-windows-ui-trial.py artifacts/trial/xWeatherRouting-2.2.0-Windows-UI-Trial.zip $plugin.FullName artifacts/trial-checks
+          if ($LASTEXITCODE -ne 0) { throw 'UI trial acceptance failed' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xWeatherRouting-2.2.0-Windows-UI-Trial
+          path: artifacts/trial
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: Windows-UI-trial-checks
+          path: |
+            artifacts/trial-checks/acceptance.json
+            artifacts/trial-checks/launcher.log
+            artifacts/trial-checks/visible-labels.json
+            artifacts/trial-checks/window-state.json
+            artifacts/trial-checks/routes

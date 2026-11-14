@@ -33,7 +33,19 @@
 extern Json::Value g_ReceivedJSONMsg;
 extern wxString g_ReceivedMessage;
 
+#include "PassageWeather.h"
 enum { WIND, CURRENT };
+
+namespace {
+std::mutex forecastMutex;
+std::shared_ptr<weather_routing::PassageWeather> internalForecast;
+}
+void WeatherDataProvider::SetInternalForecast(std::shared_ptr<weather_routing::PassageWeather> weather) {
+  std::lock_guard<std::mutex> lock(forecastMutex);internalForecast=std::move(weather);
+}
+std::shared_ptr<weather_routing::PassageWeather> WeatherDataProvider::InternalForecast() {
+  std::lock_guard<std::mutex> lock(forecastMutex);return internalForecast;
+}
 
 namespace {
 
@@ -156,6 +168,29 @@ static Json::Value RequestGRIB(const wxDateTime& time, const wxString& what,
   Json::Value v;
   Json::FastWriter writer;
   if (!time.IsValid()) return error;
+  if (auto forecast=WeatherDataProvider::InternalForecast(); forecast && forecast->Loaded()) {
+    auto frame=forecast->Frame(time.GetTicks());
+    auto** fields=frame->m_GribRecordPtrArray;
+    double magnitude,direction;
+    const bool current=what=="CURRENT SPEED";
+    if ((current||what=="WIND SPEED") && GribRecord::getInterpolatedValues(magnitude,direction,
+        fields[current?Idx_SEACURRENT_VX:Idx_WIND_VX],fields[current?Idx_SEACURRENT_VY:Idx_WIND_VY],lon,lat)) {
+      v[current?"CURRENT SPEED":"WIND SPEED"]=magnitude;
+      v[current?"CURRENT DIR":"WIND DIR"]=direction;
+    } else {
+      const std::map<wxString,int> scalar={{"SWELL",Idx_HTSIGW},{"GUST",Idx_WIND_GUST},
+        {"CLOUD COVER",Idx_CLOUD_TOT},{"RAINFALL",Idx_PRECIP_TOT},{"AIR TEMPERATURE",Idx_AIR_TEMP},
+        {"SEA TEMPERATURE",Idx_SEA_TEMP},{"PRESSURE",Idx_PRESSURE},{"CAPE",Idx_CAPE},
+        {"RELATIVE HUMIDITY",Idx_HUMID_RE}};
+      auto found=scalar.find(what);
+      if(found!=scalar.end()&&fields[found->second]) {
+        const double sample=fields[found->second]->getInterpolatedValue(lon,lat);
+        if(std::isfinite(sample)&&sample!=GRIB_NOTDEF)v[what]=sample;
+      }
+    }
+    v["Type"]="Reply";
+    return v;
+  }
 
   v["Day"] = time.GetDay();
   v["Month"] = time.GetMonth();

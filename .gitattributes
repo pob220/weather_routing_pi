@@ -1,0 +1,15 @@
+# These files are verified against dataset-manifest.json at configure time.
+# Preserve the published bytes even with Windows core.autocrlf enabled.
+data/climatology/** -text
+# The 2.2 production-engine freeze verifies repository bytes on every platform.
+# Do not let core.autocrlf alter the frozen source/model inputs on checkout.
+vendor/** -text
+third_party/** -text
+src/engine/** -text
+include/engine/adaptive/** -text
+src/headless/** -text
+src/RouteMap.cpp -text
+include/RoutingEngineSettings.h -text
+include/RoutingQualityPolicy.h -text
+include/RoutingResourcePolicy.h -text
+data/WeatherRoutingConfiguration.xml -text

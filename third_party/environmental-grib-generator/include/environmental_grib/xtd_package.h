@@ -1,0 +1,131 @@
+#pragma once
+
+#include <complex>
+#include <filesystem>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include <json/json.h>
+
+#include "environmental_grib/model.h"
+#include "environmental_grib/random_access.h"
+#include "environmental_grib/xtd.h"
+
+namespace environmental_grib {
+
+enum class OfflineCurrentMode {
+  kAstronomicalTideOnly,
+  kTideAndExpectedSeasonalCirculation,
+};
+
+std::string OfflineCurrentModeId(OfflineCurrentMode mode);
+OfflineCurrentMode ParseOfflineCurrentMode(const std::string& value);
+
+struct XtdPackageStatus {
+  std::filesystem::path path;
+  std::uint32_t format_version{};
+  Json::Value metadata;
+  bool authenticated{};
+  bool tide_available{};
+  bool climatology_available{};
+  bool uncertainty_available{};
+  bool height_available{};
+  bool height_quality_available{};
+  std::string residual_representation;
+  std::string height_datum_id;
+  std::string height_datum_name;
+  std::string package_id;
+  std::string package_hash;
+  std::string parent_package_hash;
+  double validation_ms{};
+};
+
+struct XtdPackageStatistics {
+  XtdStatistics tide;
+  XtdStatistics residual;
+  XtdStatistics uncertainty;
+  XtdStatistics height;
+  XtdStatistics height_quality;
+  std::uint64_t outer_bytes_read{};
+};
+
+struct TideHeightGrid {
+  TimePoint time;
+  RegularGrid grid;
+  std::vector<double> height_m;
+  std::vector<std::uint8_t> mask;
+  std::string datum_id;
+  std::string datum_name;
+
+  void Validate() const;
+  [[nodiscard]] bool has_mask() const { return !mask.empty(); }
+};
+
+// Constituent-major water-level coefficients sampled from an XTD.  Offline
+// XTD-to-XTD authoring uses this value without reopening the raw source model.
+struct TideHeightHarmonics {
+  RegularGrid grid;
+  std::vector<std::string> constituents;
+  std::vector<std::complex<double>> coefficients_m;
+  std::vector<std::uint8_t> mask;
+  double reference_level_m{};
+  std::string datum_id;
+  std::string datum_name;
+
+  void Validate() const;
+  [[nodiscard]] bool has_mask() const { return !mask.empty(); }
+};
+
+// Local quality information carried alongside water-level harmonics.  The
+// continuous uncertainty fields are bilinearly sampled.  Support class and
+// observation count use the nearest grid node and therefore describe the
+// local authoring support without inventing fractional classifications.
+struct TideHeightQualityGrid {
+  RegularGrid grid;
+  std::vector<double> harmonic_sigma_m;
+  std::vector<double> datum_sigma_m;
+  std::vector<double> nearest_observation_distance_km;
+  std::vector<std::uint8_t> support_class;
+  std::vector<std::uint16_t> observation_count;
+  std::vector<std::uint8_t> mask;
+
+  void Validate() const;
+  [[nodiscard]] bool has_mask() const { return !mask.empty(); }
+};
+
+class XtdPackageReader {
+public:
+  explicit XtdPackageReader(const std::filesystem::path& path,
+                            XtdReaderOptions options = {});
+  ~XtdPackageReader();
+  XtdPackageReader(XtdPackageReader&&) noexcept;
+  XtdPackageReader& operator=(XtdPackageReader&&) noexcept;
+  XtdPackageReader(const XtdPackageReader&) = delete;
+  XtdPackageReader& operator=(const XtdPackageReader&) = delete;
+
+  [[nodiscard]] const XtdPackageStatus& status() const noexcept;
+  [[nodiscard]] XtdPackageStatistics statistics() const noexcept;
+  void ClearTileCaches() noexcept;
+
+  std::vector<CurrentGrid> Predict(const RegularGrid& output_grid,
+                                   const std::vector<TimePoint>& times,
+                                   OfflineCurrentMode mode,
+                                   bool infer_minor_tides = true);
+  std::vector<TideHeightGrid> PredictHeight(const RegularGrid& output_grid,
+                                            const std::vector<TimePoint>& times,
+                                            bool infer_minor_tides = true);
+  TideHeightHarmonics SampleHeightHarmonics(const RegularGrid& output_grid);
+  TideHeightQualityGrid SampleHeightQuality(const RegularGrid& output_grid);
+  Json::Value VerifyAllComponents();
+
+private:
+  class Impl;
+  std::unique_ptr<Impl> impl_;
+};
+
+Json::Value InspectXtdPackage(const std::filesystem::path& path);
+Json::Value VerifyXtdPackage(const std::filesystem::path& path,
+                             XtdReaderOptions options = {});
+
+}  // namespace environmental_grib

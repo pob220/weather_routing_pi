@@ -1559,7 +1559,7 @@ ConfigurationDialogBase::ConfigurationDialogBase(wxWindow* parent,
       weather_routing::kDefaultMaxDivertedCourse);
   m_sMaxDivertedCourse->SetToolTip(
       _("Hard limit on how far route geometry may divert from the great-circle "
-        "route. This is separate from Advanced > Max Search Angle: increasing "
+        "route. This is separate from Routing controls > Max Search Angle: increasing "
         "the search angle does not override this limit. Use 180 degrees when "
         "the route may need to begin away from the destination or pass around "
         "an island, peninsula or other land obstruction."));
@@ -1698,11 +1698,11 @@ ConfigurationDialogBase::ConfigurationDialogBase(wxWindow* parent,
   m_cBasicRoutingMode->Append(_("Auto"));
   m_cBasicRoutingMode->Append(_("All (slow)"));
   m_cBasicRoutingMode->SetSelection(0);
-  m_cBasicRoutingMode->SetToolTip(_("Choose engines and individual-engine testing in Advanced. The Fastest / Comfort selector remains available for retained alternatives."));
+  m_cBasicRoutingMode->SetToolTip(_("Choose engines and individual-engine testing in Routing controls. The Fastest / Comfort selector remains available for retained alternatives."));
   engineBox->Add(m_cBasicRoutingMode, 0, wxALL | wxEXPAND, 5);
   m_cBasicRoutingMode->Bind(wxEVT_CHOICE, [this](wxCommandEvent& event) { OnUpdate(event); });
   m_tRoutingEngineDescription = new wxStaticText(engineBox->GetStaticBox(), wxID_ANY,
-      _("Auto finds a validated route using the engines selected in Advanced. Enable alternatives to compare passage time and comfort."));
+      _("Auto finds a validated route using the engines selected in Routing controls. Enable alternatives to compare passage time and comfort."));
   m_tRoutingEngineDescription->Wrap(430);
   engineBox->Add(m_tRoutingEngineDescription, 0, wxALL | wxEXPAND, 5);
   m_cbExploreComfortAlternatives = new wxCheckBox(engineBox->GetStaticBox(), wxID_ANY,
@@ -1885,7 +1885,7 @@ ConfigurationDialogBase::ConfigurationDialogBase(wxWindow* parent,
   fgSizer106->Fit(m_pBasic);
   reflowBasicHelp(m_pBasic->GetClientSize().x);
 #endif
-  m_notebook7->AddPage(m_pBasic, _("Basic"), true);
+  m_notebook7->AddPage(m_pBasic, _("Passage settings"), true);
   m_pAdvanced = new wxScrolledWindow(
       m_notebook7, wxID_ANY, wxDefaultPosition, wxDefaultSize,
       wxVSCROLL | wxTAB_TRAVERSAL);
@@ -2051,10 +2051,10 @@ ConfigurationDialogBase::ConfigurationDialogBase(wxWindow* parent,
   m_cRoutingEffortPercent =
       new wxChoice(m_pMainEngine, wxID_ANY, wxDefaultPosition,
                    wxSize(180, -1));
-  m_cRoutingEffortPercent->Append(_("100% — Standard"));
-  m_cRoutingEffortPercent->Append(_("150% — Extended"));
-  m_cRoutingEffortPercent->Append(_("200% — Thorough"));
-  m_cRoutingEffortPercent->Append(_("400% — Exhaustive"));
+  m_cRoutingEffortPercent->Append(_(L"100% — Standard"));
+  m_cRoutingEffortPercent->Append(_(L"150% — Extended"));
+  m_cRoutingEffortPercent->Append(_(L"200% — Thorough"));
+  m_cRoutingEffortPercent->Append(_(L"400% — Exhaustive"));
   m_cRoutingEffortPercent->SetSelection(0);
   m_cRoutingEffortPercent->SetMinSize(wxDefaultSize);
   m_cRoutingEffortPercent->InvalidateBestSize();
@@ -2387,7 +2387,7 @@ ConfigurationDialogBase::ConfigurationDialogBase(wxWindow* parent,
 
   wxStaticText* departureConcurrencyLabel =
       new wxStaticText(sbOptions1->GetStaticBox(), wxID_ANY,
-                       _("Departure-time route workers"), wxDefaultPosition,
+                       _("Departure-time workers (0 = Auto)"), wxDefaultPosition,
                        wxDefaultSize, 0);
   departureConcurrencyLabel->Wrap(-1);
   fgSizerDepartureConcurrency->Add(
@@ -2437,7 +2437,7 @@ ConfigurationDialogBase::ConfigurationDialogBase(wxWindow* parent,
       "Maximum RAM used by the plugin's authoritative chart-safety tile "
       "cache. This does not limit all OpenCPN memory. Use 0 for Auto "
       "(approximately 1/32 of physical RAM, bounded from 256 to 2048 MiB). "
-      "Certified tiles remain persistently cached on disk between launches."));
+      "Previously checked chart tiles remain cached on disk between launches."));
   fgSizerChartSafetyRam->Add(
       m_sChartSafetyRamCacheMiB, 0, wxALIGN_CENTER_VERTICAL | wxALL, 5);
 
@@ -2615,8 +2615,8 @@ ConfigurationDialogBase::ConfigurationDialogBase(wxWindow* parent,
   for (const auto& label : {_("0 / Crude"), _("1 / Low"), _("2 / Intermediate"),
                             _("3 / High"), _("4 / Full")})
 #else
-  for (const auto& label : {_("0 — Crude"), _("1 — Low"), _("2 — Intermediate"),
-                            _("3 — High"), _("4 — Full")})
+  for (const auto& label : {_(L"0 — Crude"), _(L"1 — Low"), _(L"2 — Intermediate"),
+                            _(L"3 — High"), _(L"4 — Full")})
 #endif
     m_cShorelineResolution->Append(label);
   m_cShorelineResolution->SetSelection(2);
@@ -2913,7 +2913,7 @@ ConfigurationDialogBase::ConfigurationDialogBase(wxWindow* parent,
   reflowAdvancedHelp(m_pAdvanced->GetClientSize().x);
   m_pAdvanced->FitInside();
 #endif
-  m_notebook7->AddPage(m_pAdvanced, _("Advanced"), false);
+  m_notebook7->AddPage(m_pAdvanced, _("Routing controls"), false);
 
 #ifdef __OCPN__ANDROID__
   // Reuse the complete shared configuration controls in focused tablet pages.

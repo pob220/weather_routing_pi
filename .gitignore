@@ -10,6 +10,10 @@ master.zip
 OCPNAndroidCommon*
 .android-ci/
 .windows64/
+.windows64-wx329/
+.windows-deps/
+compatibility/
+__pycache__/
 .windows86-host/
 .macos-host/
 build_android_arm64_codex/

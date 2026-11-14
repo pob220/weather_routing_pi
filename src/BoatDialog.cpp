@@ -207,7 +207,7 @@ BoatDialog::BoatDialog(WeatherRouting& weatherrouting)
   m_lPolars->InsertColumn(spFILENAME, _("Filename"));
 
   wxFileConfig* pConf = GetOCPNConfigObject();
-  pConf->SetPath(_T( "/PlugIns/WeatherRouting/BoatDialog" ));
+  pConf->SetPath(_T( "/PlugIns/xWeatherRouting2/BoatDialog" ));
 
 #ifdef __OCPN__ANDROID__
   // Give each boat task its own full-width page, with the page selector
@@ -386,7 +386,7 @@ BoatDialog::~BoatDialog() {
     return;
   }
   wxFileConfig* pConf = GetOCPNConfigObject();
-  pConf->SetPath(_T( "/PlugIns/WeatherRouting/BoatDialog" ));
+  pConf->SetPath(_T( "/PlugIns/xWeatherRouting2/BoatDialog" ));
 }
 
 void BoatDialog::LoadPolar(const wxString& filename) {
@@ -919,7 +919,7 @@ void BoatDialog::OnOverlapPercentage(wxSpinEvent& event) {
 
 void BoatDialog::OnOpenBoat(wxCommandEvent& event) {
   wxFileConfig* pConf = GetOCPNConfigObject();
-  pConf->SetPath(_T( "/PlugIns/WeatherRouting/BoatDialog" ));
+  pConf->SetPath(_T( "/PlugIns/xWeatherRouting2/BoatDialog" ));
 
   wxString path;
   pConf->Read(_T ( "BoatPath" ), &path,
@@ -930,7 +930,7 @@ void BoatDialog::OnOpenBoat(wxCommandEvent& event) {
       wxT("Boat polar (*.xml)|*.XML;*.xml|All files (*.*)|*.*"), wxFD_OPEN);
 
   if (openDialog.ShowModal() == wxID_OK) {
-    pConf->SetPath(_T( "/PlugIns/WeatherRouting/BoatDialog" ));
+    pConf->SetPath(_T( "/PlugIns/xWeatherRouting2/BoatDialog" ));
     pConf->Write(_T ( "BoatPath" ), openDialog.GetDirectory());
 
     wxString filename = openDialog.GetPath();
@@ -960,7 +960,7 @@ void BoatDialog::SaveBoat() {
 
   if (m_boatpath.empty()) {
     wxFileConfig* pConf = GetOCPNConfigObject();
-    pConf->SetPath(_T( "/PlugIns/WeatherRouting/BoatDialog" ));
+    pConf->SetPath(_T( "/PlugIns/xWeatherRouting2/BoatDialog" ));
 
     wxString path;
     pConf->Read(_T ( "BoatPath" ), &path,
@@ -972,7 +972,7 @@ void BoatDialog::SaveBoat() {
         wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
 
     if (saveDialog.ShowModal() == wxID_OK) {
-      pConf->SetPath(_T( "/PlugIns/WeatherRouting/BoatDialog" ));
+      pConf->SetPath(_T( "/PlugIns/xWeatherRouting2/BoatDialog" ));
       pConf->Write(_T ( "BoatPath" ), saveDialog.GetDirectory());
 
       wxString filename =
@@ -1123,7 +1123,7 @@ void BoatDialog::OnEditPolar(wxCommandEvent& event) {
 
 void BoatDialog::OnAddPolar(wxCommandEvent& event) {
   wxFileConfig* pConf = GetOCPNConfigObject();
-  pConf->SetPath(_T( "/PlugIns/WeatherRouting/BoatDialog" ));
+  pConf->SetPath(_T( "/PlugIns/xWeatherRouting2/BoatDialog" ));
 
   wxString path;
   pConf->Read(_T ( "PolarPath" ), &path,

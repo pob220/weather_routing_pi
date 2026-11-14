@@ -28,6 +28,8 @@
 #include "SunCalculator.h"
 #include "SystemMemory.h"
 #include "WeatherDataProvider.h"
+#include "PassageWeather.h"
+#include "BundledClimatology.h"
 #include "engine/native/ComfortAlternatives.h"
 #include "engine/native/ConstraintTime.h"
 #include "engine/native/CoordinateNormalization.h"
@@ -179,6 +181,17 @@ public:
   wr::ParameterCoverage forecastWindCoverage() const {
     if (windCoverage_) return *windCoverage_;
     wr::ParameterCoverage coverage;
+    if (auto local=WeatherDataProvider::InternalForecast(); configuration_.UseGrib && local && local->Loaded()) {
+      auto records=local->Frame(local->FirstWindTime());
+      const auto* u=records->m_GribRecordPtrArray[Idx_WIND_VX];
+      const auto* v=records->m_GribRecordPtrArray[Idx_WIND_VY];
+      if(u&&v)coverage=weather_routing::native::WindGridCoverage(
+          u->getLonMin(),u->getLatMin(),u->getLonMax(),u->getLatMax(),u->getDi(),
+          v->getLonMin(),v->getLatMin(),v->getLonMax(),v->getLatMax(),v->getDi());
+      coverage.begins=wr::TimePoint(std::chrono::seconds(local->FirstWindTime()));
+      coverage.ends=wr::TimePoint(std::chrono::seconds(local->LastWindTime()));
+      coverage.datasetIdentity=local->Identity();windCoverage_=coverage;return coverage;
+    }
     Shared_GribRecordSet frame;
     if (configuration_.UseGrib && overlay_.AcquireGribTimelineFrame(
             configuration_.StartTime, frame)) {
@@ -216,6 +229,14 @@ public:
         coverage = weather_routing::native::WindGridCoverage(
             h->getLonMin(), h->getLatMin(), h->getLonMax(), h->getLatMax(), h->getDi(),
             h->getLonMin(), h->getLatMin(), h->getLonMax(), h->getLatMax(), h->getDi());
+    }
+    if(auto local=WeatherDataProvider::InternalForecast(); local && local->Loaded()) {
+      const auto e=local->Extent(Idx_HTSIGW);
+      if(e.first>=0) {
+        coverage.begins=wr::TimePoint(std::chrono::seconds(e.first));
+        coverage.ends=wr::TimePoint(std::chrono::seconds(e.second));
+        coverage.datasetIdentity=local->Identity();
+      }
     }
     // This describes the departure frame only. Missing cells and later wave
     // coverage are checked by the same sampler during search and validation.
@@ -277,7 +298,9 @@ public:
   }
 
   std::string identity() const override {
-    return "OpenCPN GRIB/climatology timeline";
+    if(auto local=WeatherDataProvider::InternalForecast(); local && local->Loaded())
+      return local->Identity()+"; "+weather_routing::BundledClimatology::Source().ToStdString();
+    return "OpenCPN GRIB/climatology timeline; "+weather_routing::BundledClimatology::Source().ToStdString();
   }
 
   struct CacheDiagnostics {
@@ -919,6 +942,7 @@ class AdaptiveWeatherProbe final : public wr::WeatherProvider {
 public:
   AdaptiveWeatherProbe(RouteMapOverlay& overlay, RouteMapConfiguration configuration)
       : overlay_(overlay), configuration_(std::move(configuration)),
+        source_(WeatherDataProvider::InternalForecast()),
         deadline_(std::chrono::steady_clock::now() + std::chrono::milliseconds{500}) {}
   wr::ParameterCoverage windCoverage() const override { return {}; }
   wr::ParameterCoverage currentCoverage() const override { return {}; }
@@ -967,7 +991,29 @@ private:
     auto c = configuration_;
     c.time = ToWx(t); c.grib = nullptr; c.output_grib_point_queries = false;
     c.grib_is_data_deficient = false;
-    {
+    if (c.UseGrib && source_ && source_->Loaded()) {
+      const auto at = [&](int index) { return source_->Sample(index,
+          t.time_since_epoch().count(), p.latitude, p.longitude); };
+      if (c.Currents) {
+        const auto u = at(Idx_SEACURRENT_VX), v = at(Idx_SEACURRENT_VY);
+        if (u && v) { out.current.available = true; out.current.velocity = {*u * 1.9438444924406, *v * 1.9438444924406}; }
+      }
+      const auto u = at(Idx_WIND_VX), v = at(Idx_WIND_VY);
+      if (u && v) {
+        out.wind.available = true;
+        out.wind.velocity = {*u * 1.9438444924406 * c.WindStrength,
+                             *v * 1.9438444924406 * c.WindStrength};
+      }
+      Samples fallback;
+      if (!out.wind.available || (c.Currents && !out.current.available))
+        fallback = prepared(c, p);
+      const auto selected = weather_routing::adaptive::SelectAdvisoryWindCurrent(
+          {out.wind, out.current}, {fallback.wind, fallback.current});
+      out.wind = selected.wind; out.current = selected.current;
+      if (const auto h = at(Idx_HTSIGW); h && *h >= 0) {
+        out.waves.available = true; out.waves.significantHeightMetres = *h;
+      }
+    } else {
       Shared_GribRecordSet frame;
       // An absent/busy frame stays unknown to the authoritative provider. An
       // explicitly permitted prepared fallback can still estimate search cost.
@@ -983,6 +1029,7 @@ private:
   }
   RouteMapOverlay& overlay_;
   RouteMapConfiguration configuration_;
+  std::shared_ptr<weather_routing::PassageWeather> source_;
   std::chrono::steady_clock::time_point deadline_;
   mutable bool valid_{};
   mutable wr::GeoPoint position_;

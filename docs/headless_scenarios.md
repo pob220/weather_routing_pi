@@ -52,11 +52,11 @@ timeline-frame cache for the run. Values are 16–8192 MiB on 64-bit builds and
 RAM admission and runtime reserve rules.
 
 For repeatable integration tests, `WR_HEADLESS_GRIB_FILE` can name an existing
-GRIB file. The runner asks the GRIB plugin to open it through the plugin's
-public message interface before routing starts. Weather Routing does not parse
-the file or depend on GRIB internals. Without this variable, a fresh headless
-process may report `no weather data at route time/window` until another
-component has initialized the GRIB timeline.
+GRIB file. In version 2 the scenario runner opens it with Weather Routing's
+integrated forecast reader; a separate GRIB plugin is not required. Without
+this variable, forecast routing needs an already selected internal forecast.
+Bundled Climatology can supply wind when explicitly selected or allowed as
+fallback. Its data are seasonal estimates, not current forecasts.
 
 ## Environment Variables
 
@@ -66,8 +66,8 @@ component has initialized the GRIB timeline.
 an initial `running` result when the scenario starts and overwrites it with the
 final result when the run completes or fails.
 
-`WR_HEADLESS_GRIB_FILE` optionally names the GRIB file to open through the GRIB
-plugin's existing JSON message interface. The file must exist and cover the
+`WR_HEADLESS_GRIB_FILE` optionally names the GRIB file to open with the version 2
+integrated reader. The file must exist and cover the
 scenario's route area and the portion of the departure/arrival window expected
 to use forecast data. Routes are not limited to the in-memory GRIB working-set
 duration: old frames are evicted and reacquired as needed. Whether a route may
@@ -499,3 +499,22 @@ order, skipping unchecked engines. A retained Quick2 candidate cannot reduce
 Standard's allowance or restrict its search. `WR_HEADLESS_ENGINE_CONFIGURATION_CONTRACT=1`
 in a disposable scenario exercises the real Basic/Advanced controls and saved
 membership, and logs `WR_ENGINE_CONFIGURATION_CONTRACT passed=1` on success.
+
+## UI descriptions in 2.1
+
+The passage screen and settings help describe existing settings and zero-value
+meanings. This is not a new scenario schema, validation regime or set of engine
+defaults. Omitted route/environment/safety fields continue to inherit through
+the existing `has*` mechanism; a displayed UI default must not be serialized as
+an explicit override merely because the field was omitted.
+
+Sailing angles are relative to true wind (0–180 degrees), not compass bearings.
+The settings editor displays performance adjustments as percentages; scenario
+values remain multipliers (100% = 1.0). Zero disables wind, wave and depth
+limits; zero departure concurrency means Auto. Zero is an ordinary value for
+other controls unless their existing documentation states otherwise.
+
+A positive charted-depth requirement needs the existing compatible host service,
+charted depth coverage and enforced chart checks. GSHHG shoreline checks cannot
+supply charted depths. Route-agreement corridors compare calculated routes;
+their thresholds are neither forecast probabilities nor safe-water boundaries.

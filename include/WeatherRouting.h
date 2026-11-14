@@ -57,10 +57,17 @@ class wxScrolledWindow;
 #include "RouteSimplifier.h"
 #include "StabilityCorridorLifecycle.h"
 #include "GribTimelineFrameCache.h"
+#include "RunDiagnosticsJournal.h"
 #include "weather_routing_engine/StabilityCorridor.h"
 
 class weather_routing_pi;
 class WeatherRouting;
+class PassagePanel;
+#ifdef __OCPN__ANDROID__
+class AndroidPassageWeatherDialog;
+#endif
+class wxAuiNotebook;
+namespace weather_routing { class PassageWeather; struct PassageInputs; }
 
 /**
  * Class representing a weather routing configuration and its associated route.
@@ -224,6 +231,11 @@ class WeatherRouting : public WeatherRoutingBase {
 private:
   friend class RoutingTablePanel;
   friend class RouteComparisonDialog;
+  friend class PassagePanel;
+  std::shared_ptr<weather_routing::PassageWeather> m_PassageWeather;
+  PassagePanel* m_PassagePanel{nullptr};
+  wxAuiNotebook* m_PassageNotebook{nullptr};
+  void RequestPassageWeatherDisplay(const wxString& path);
 
   bool m_disable_colpane;
   wxCollapsiblePane* m_colpane;
@@ -233,9 +245,6 @@ private:
   wxTimer m_tAutoSaveXML;
 
 public:
-  void ApplyNewAdaptiveSettingsChoice(RouteMapConfiguration& configuration) const;
-  void RememberAdaptiveSettingsChoice(bool enabled);
-  void SaveAdaptiveHostContractSnapshot(const wxString& path);
   enum {
     POSITION_NAME = 0,  //!< Position identifier/name
     POSITION_LAT,       //!< Latitude coordinate
@@ -279,6 +288,21 @@ public:
 
   WeatherRouting(wxWindow* parent, weather_routing_pi& plugin);
   ~WeatherRouting();
+  weather_routing::PassageWeather& PassageForecast();
+  bool OpenPassageForecast(const wxString& path, wxString& error);
+  bool OpenPassageForecastForUser(const wxString& path, wxString& error);
+  weather_routing::PassageInputs InspectPassageInputs(
+      const RouteMapConfiguration& configuration, Boat& boatModel,
+      bool& climateWindReady);
+  void ApplyPassageConfiguration(const RouteMapConfiguration& configuration);
+  void DisablePassageDrawExclusions();
+  void RememberWeatherSourceChoice(const RouteMapConfiguration& configuration);
+  void ApplyWeatherSourceChoice(RouteMapConfiguration& configuration) const;
+  void ApplyNewPassageEngineChoices(RouteMapConfiguration& configuration) const;
+  void ApplyNewAdaptiveSettingsChoice(RouteMapConfiguration& configuration) const;
+  void RememberAdaptiveSettingsChoice(bool enabled);
+  void SaveAdaptiveHostContractSnapshot(const wxString& path);
+  void RefreshPassageSelection() { OnWeatherRouteSelected(); }
 
 #ifdef __OCPN__ANDROID__
   void OnEvtPanGesture(wxQT_PanGestureEvent& event);
@@ -444,7 +468,8 @@ public:
    */
   void AddPosition(double lat, double lon, wxString name, wxString GUID);
   void AddRoute(wxString& GUID);
-  bool CreateMultiLegConfigurationsFromRoute(const wxString& routeGuid);
+  bool CreateMultiLegConfigurationsFromRoute(const wxString& routeGuid,
+                                            bool editSettings = true);
   bool ComputeMultiLegSequence(RouteMapOverlay* selectedRoute);
   bool EditMultiLegGroupSettings(RouteMapOverlay* selectedRoute);
 
@@ -749,7 +774,7 @@ private:
   void AdvanceMultiLegDepartureOptimization(RouteMapOverlay* completedRoute);
   void ShowMultiLegDepartureOptimizationResults();
   void DeleteMultiLegOptimizationCandidateRows();
-  void ShowRoutingProgress(const wxString& title);
+  void ShowRoutingProgress(const wxString& title, bool newRun = true);
   void UpdateRoutingProgress(const wxString& stage, const wxString& detail,
                              int value = -1, int range = -1);
   void FinishRoutingProgress(const wxString& stage, const wxString& detail);
@@ -757,6 +782,7 @@ private:
   void OnRoutingProgressTimer(wxTimerEvent&);
   void RefreshRoutingProgressTiming();
   void PaintRoutingProgressNow();
+  void RefreshRunDiagnosticsRecord();
   void RecordChartSafetyPreparationFailure(RouteMapOverlay* route,
                                            const wxString& reason);
   bool ValidateChartSafetyEndpoints(RouteMapOverlay* route,
@@ -907,7 +933,7 @@ private:
   void DeleteRouteMaps(std::list<RouteMapOverlay*> routemapoverlays);
   RouteMapConfiguration DefaultConfiguration(bool newPassagePreferences = true);
   void ApplyLastUsedConfigurationDefaults(
-      RouteMapConfiguration& configuration) const;
+      RouteMapConfiguration& configuration, bool newPassagePreferences = true) const;
 
   void AddRoutingPanel();
 
@@ -962,6 +988,9 @@ private:
   wxStaticText* m_RoutingProgressStage;
   wxTextCtrl* m_RoutingProgressDetail;
   wxStaticText* m_RoutingProgressTiming;
+  wxTextCtrl* m_RoutingProgressHistory = nullptr;
+  weather_routing::RunDiagnosticsJournal m_RunDiagnostics;
+  wxDateTime m_RoutingProgressFinishedAt;
   wxGauge* m_RoutingProgressGauge;
   wxButton* m_StopComfortButton{nullptr};
   wxDateTime m_RoutingProgressStartTime;
@@ -999,7 +1028,25 @@ public:
   void CancelAndroidChartPick();
   bool HandleAndroidChartPick(wxMouseEvent& event, PlugIn_ViewPort* viewport);
 private:
-  bool EditAndroidPosition(wxString& name, double& latitude, double& longitude);
+  bool EditAndroidPosition(wxString& name, double& latitude, double& longitude,
+                           bool waypoint = false);
+  void LoadAndroidPassageWeather();
+  void GenerateAndroidPassageWeather();
+  void RefreshAndroidPassageWeather();
+  void RefreshAndroidReadiness(RouteMapOverlay* route);
+  void ReviewAndroidReadiness();
+  void EditAndroidRouteWaypoint();
+  std::vector<wxButton*> m_androidComputeSelected;
+  std::unique_ptr<Boat> m_androidReadinessBoat;
+  bool m_androidClimateReady{false};
+  wxStaticText* m_androidReadinessStatus{nullptr};
+  wxButton* m_androidReadinessAction{nullptr};
+  weather_routing::RouteDiagnosticReport m_androidReadinessReport;
+  std::string m_androidReadinessCode;
+  std::unique_ptr<AndroidPassageWeatherDialog> m_androidGenerator;
+  wxString m_androidGeneratedForecast;
+  wxStaticText* m_androidForecastStatus{nullptr};
+  std::vector<wxButton*> m_androidForecastActions;
   int m_androidChartPickTarget{-2};
   wxDialog* m_androidChartPickHint{nullptr};
   wxPoint m_androidChartPickDown;

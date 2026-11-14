@@ -1,0 +1,217 @@
+#include "environmental_grib/geo.h"
+#include "environmental_grib/area_validation.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <ctime>
+#include <iomanip>
+#include <limits>
+#include <sstream>
+
+#include "environmental_grib/error.h"
+#include "environmental_grib/platform.h"
+
+namespace environmental_grib {
+
+double Longitude360(double longitude) {
+  double result = std::fmod(longitude, 360.0);
+  if (result < 0.0) result += 360.0;
+  return result >= 360.0 ? 0.0 : result;
+}
+
+double Longitude180(double longitude) {
+  return Longitude360(longitude + 180.0) - 180.0;
+}
+
+double UnwrapLongitude(double longitude, double west) {
+  double offset = Longitude360(longitude - west);
+  if (offset > 360.0 - 1e-10) offset = 0.0;
+  return west + offset;
+}
+
+bool IsCyclicLongitudeAxis(double step, std::size_t count) {
+  return count > 1 && std::abs(std::abs(step) * count - 360.0) <=
+      std::max(1e-5, std::abs(step) * 1e-3);
+}
+
+LongitudeAxis OrderLongitudeAxis(const std::vector<double>& coordinates) {
+  std::vector<std::pair<double, std::size_t>> columns;
+  for (std::size_t i = 0; i < coordinates.size(); ++i) {
+    if (!std::isfinite(coordinates[i]))
+      throw ValidationError("source longitude coordinates must be finite");
+    columns.emplace_back(Longitude360(coordinates[i]), i);
+  }
+  std::stable_sort(columns.begin(), columns.end());
+  columns.erase(std::unique(columns.begin(), columns.end(), [](const auto& a, const auto& b) {
+    return std::abs(a.first - b.first) < 1e-8;
+  }), columns.end());
+  if (columns.size() < 2)
+    throw ValidationError("source longitude axis must have at least two distinct points");
+  double maximum_gap = -1.0, minimum_gap = 360.0;
+  std::size_t start = 0;
+  for (std::size_t i = 0; i < columns.size(); ++i) {
+    const auto next = (i + 1) % columns.size();
+    const double gap = next ? columns[next].first - columns[i].first
+                            : columns[0].first + 360.0 - columns[i].first;
+    minimum_gap = std::min(minimum_gap, gap);
+    if (gap > maximum_gap) { maximum_gap = gap; start = next; }
+  }
+  LongitudeAxis result;
+  result.cyclic = maximum_gap - minimum_gap <= std::max(1e-5, maximum_gap * 1e-3);
+  if (result.cyclic) start = 0;
+  const double origin = Longitude180(columns[start].first);
+  for (std::size_t i = 0; i < columns.size(); ++i) {
+    const auto& column = columns[(start + i) % columns.size()];
+    result.coordinates.push_back(UnwrapLongitude(column.first, origin));
+    result.indices.push_back(column.second);
+  }
+  return result;
+}
+
+double BoundingBox::Width() const {
+  return east > west ? east - west : east + 360.0 - west;
+}
+
+void BoundingBox::Validate() const {
+  const auto issue = ValidateDownloadArea(west, south, east, north);
+  if (issue.message) throw ValidationError(issue.message);
+}
+
+bool BoundingBox::Contains(const BoundingBox& other) const {
+  const double start = UnwrapLongitude(other.west, west);
+  return (Width() >= 360.0 - 1e-8 ||
+          (start >= west && start + other.Width() <= UnwrappedEast() + 1e-8)) &&
+         other.south >= south && other.north <= north;
+}
+
+bool BoundingBox::ContainsLongitude(double longitude, double tolerance) const {
+  return Width() >= 360.0 - tolerance ||
+         UnwrapLongitude(longitude, west - tolerance) <= UnwrappedEast() + tolerance;
+}
+
+TimePoint ParseUtcDateTime(const std::string& value) {
+  std::string raw = value;
+  if (raw.empty()) throw ValidationError("datetime cannot be empty");
+
+  int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
+  char separator = 0;
+  int consumed = 0;
+  if (std::sscanf(raw.c_str(), "%d-%d-%d%c%d:%d:%d%n", &year, &month, &day,
+                  &separator, &hour, &minute, &second, &consumed) != 7 ||
+      (separator != 'T' && separator != ' ')) {
+    throw ValidationError("invalid datetime '" + value +
+                          "'; use ISO-8601, e.g. 2026-07-01T00:00:00Z");
+  }
+  int offset_seconds = 0;
+  const std::string suffix = raw.substr(static_cast<std::size_t>(consumed));
+  if (suffix == "Z" || suffix == "+00:00") {
+    offset_seconds = 0;
+  } else if (suffix.size() == 6 && (suffix[0] == '+' || suffix[0] == '-')) {
+    int offset_hour = 0, offset_minute = 0;
+    if (std::sscanf(suffix.c_str() + 1, "%d:%d", &offset_hour,
+                    &offset_minute) != 2 ||
+        offset_hour > 23 || offset_minute > 59) {
+      throw ValidationError("invalid datetime timezone offset");
+    }
+    offset_seconds =
+        (offset_hour * 3600 + offset_minute * 60) * (suffix[0] == '+' ? 1 : -1);
+  } else {
+    throw ValidationError(
+        "datetime must include a timezone; UTC 'Z' is recommended");
+  }
+  if (month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 ||
+      minute > 59 || second > 60) {
+    throw ValidationError("invalid datetime fields");
+  }
+  if (!std::chrono::year_month_day{std::chrono::year{year},
+          std::chrono::month{static_cast<unsigned>(month)},
+          std::chrono::day{static_cast<unsigned>(day)}}.ok())
+    throw ValidationError("invalid calendar date");
+  std::tm tm{};
+  tm.tm_year = year - 1900;
+  tm.tm_mon = month - 1;
+  tm.tm_mday = day;
+  tm.tm_hour = hour;
+  tm.tm_min = minute;
+  tm.tm_sec = std::min(second, 59);
+  const std::time_t utc = UtcTimeToEpoch(&tm);
+  const std::tm check = UtcTime(utc);
+  if (check.tm_year != tm.tm_year || check.tm_mon != tm.tm_mon ||
+      check.tm_mday != tm.tm_mday || check.tm_hour != tm.tm_hour ||
+      check.tm_min != tm.tm_min) {
+    throw ValidationError("invalid calendar date");
+  }
+  return TimePoint{std::chrono::seconds{utc - offset_seconds}};
+}
+
+std::string FormatUtcDateTime(TimePoint value) {
+  const auto seconds = value.time_since_epoch().count();
+  const std::time_t raw = static_cast<std::time_t>(seconds);
+  const std::tm tm = UtcTime(raw);
+  std::ostringstream out;
+  out << std::put_time(&tm, "%Y-%m-%dT%H:%M:%SZ");
+  return out.str();
+}
+
+std::pair<std::size_t, std::size_t> RegularGridDimensions(
+    const BoundingBox& bbox, double spacing_deg) {
+  bbox.Validate();
+  if (!std::isfinite(spacing_deg) || spacing_deg <= 0.0) {
+    throw ValidationError("grid spacing must be greater than zero");
+  }
+  const double width = bbox.Width();
+  const double height = bbox.north - bbox.south;
+  const double tolerance = std::max(1e-12, spacing_deg * 1e-9);
+  if (spacing_deg > width + tolerance || spacing_deg > height + tolerance) {
+    throw ValidationError(
+        "grid spacing must be smaller than both bbox width and height");
+  }
+  if (width / spacing_deg > 5'000'000 || height / spacing_deg > 5'000'000)
+    throw ValidationError("grid is too large; reduce bbox or increase spacing");
+  const auto nx =
+      static_cast<std::size_t>(std::llround(width / spacing_deg)) + 1;
+  const auto ny =
+      static_cast<std::size_t>(std::llround(height / spacing_deg)) + 1;
+  if (nx < 2 || ny < 2)
+    throw ValidationError(
+        "grid must contain at least two points in each dimension");
+  if (nx > 5'000'000 / ny) {
+    throw ValidationError("grid is too large; reduce bbox or increase spacing");
+  }
+  return {nx, ny};
+}
+
+RegularGrid BuildRegularGrid(const BoundingBox& bbox, double spacing_deg) {
+  const auto [nx, ny] = RegularGridDimensions(bbox, spacing_deg);
+  RegularGrid grid;
+  grid.spacing_deg = spacing_deg;
+  grid.latitude_spacing_deg = (bbox.north - bbox.south) / (ny - 1);
+  grid.longitude_spacing_deg = bbox.Width() / (nx - 1);
+  grid.longitudes.resize(nx);
+  grid.latitudes.resize(ny);
+  for (std::size_t i = 0; i < nx; ++i)
+    grid.longitudes[i] = bbox.west + static_cast<double>(i) * grid.longitude_spacing_deg;
+  for (std::size_t j = 0; j < ny; ++j)
+    grid.latitudes[j] = bbox.south + static_cast<double>(j) * grid.latitude_spacing_deg;
+  grid.longitudes.back() = bbox.UnwrappedEast();
+  grid.latitudes.back() = bbox.north;
+  return grid;
+}
+
+std::vector<TimePoint> BuildTimeSequence(TimePoint start, int hours,
+                                         int step_hours) {
+  if (hours < 0) throw ValidationError("hours must be zero or greater");
+  if (step_hours <= 0)
+    throw ValidationError("step-hours must be greater than zero");
+  if (hours % step_hours != 0)
+    throw ValidationError("hours must be evenly divisible by step-hours");
+  std::vector<TimePoint> result;
+  result.reserve(static_cast<std::size_t>(hours / step_hours + 1));
+  for (int hour = 0; hour <= hours; hour += step_hours) {
+    result.push_back(start + std::chrono::hours{hour});
+  }
+  return result;
+}
+
+}  // namespace environmental_grib

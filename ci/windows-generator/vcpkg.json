@@ -1,0 +1,9 @@
+{
+  "name": "xweather-routing-generator",
+  "version-string": "2.0.0",
+  "builtin-baseline": "cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3",
+  "dependencies": [
+    "bzip2", "blosc", "curl", "eccodes", "jsoncpp", "libzip",
+    "libsodium", "netcdf-c", "proj", "qhull", "zstd"
+  ]
+}

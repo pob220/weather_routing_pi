@@ -3635,7 +3635,7 @@
             <property name="window_style"></property>
             <object class="notebookpage" expanded="false">
               <property name="bitmap"></property>
-              <property name="label">Basic</property>
+              <property name="label">Passage settings</property>
               <property name="select">0</property>
               <object class="wxPanel" expanded="false">
                 <property name="BottomDockable">1</property>
@@ -5988,7 +5988,7 @@
             </object>
             <object class="notebookpage" expanded="false">
               <property name="bitmap"></property>
-              <property name="label">Advanced</property>
+              <property name="label">Routing controls</property>
               <property name="select">1</property>
               <object class="wxScrolledWindow" expanded="false">
                 <property name="BottomDockable">1</property>

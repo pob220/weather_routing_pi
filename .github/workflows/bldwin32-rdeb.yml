@@ -7,6 +7,8 @@ on:
 
 jobs:
   build-win32:
+    # v2's integrated Windows runtime is being qualified on x64.
+    if: ${{ !startsWith(github.ref, 'refs/heads/feature/xweather-2.') && !startsWith(github.head_ref, 'feature/xweather-2.') }}
     runs-on: windows-2022
     env:
       VCPKG_DEFAULT_TRIPLET: x86-windows

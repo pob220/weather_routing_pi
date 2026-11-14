@@ -4,6 +4,7 @@ Generate import libraries from that host's actual export tables rather than
 reusing the x86 libraries shipped in opencpn-libs. The host is only extracted,
 never installed, so the executor's existing OpenCPN profile is unaffected.
 """
+import argparse
 import hashlib
 import json
 import os
@@ -14,8 +15,11 @@ import struct
 import subprocess
 import sys
 import tarfile
+import time
+import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
+from windows_build_tools import select_msvc
 
 ROOT = Path(__file__).resolve().parents[1]
 WX_VERSION = os.environ.get('WEATHER_ROUTING_WINDOWS_WX_VERSION', '3.3.4')
@@ -44,8 +48,17 @@ def download(url, path, expected):
     path.parent.mkdir(parents=True, exist_ok=True)
     if not path.exists():
         partial = path.with_suffix(path.suffix + '.part')
-        with urllib.request.urlopen(url, timeout=120) as response, partial.open('wb') as output:
-            shutil.copyfileobj(response, output)
+        for attempt in range(4):
+            try:
+                with urllib.request.urlopen(url, timeout=120) as response, partial.open('wb') as output:
+                    shutil.copyfileobj(response, output)
+                break
+            except (urllib.error.URLError, TimeoutError, ConnectionResetError) as error:
+                if (attempt == 3 or (isinstance(error, urllib.error.HTTPError) and
+                        error.code not in (408, 429, 500, 502, 503, 504))):
+                    raise
+                print(f'Temporary download failure for {path.name}; retry {attempt + 1}/3: {error}', flush=True)
+                time.sleep(2 * (attempt + 1))
         if digest(partial) != expected:
             raise RuntimeError(f'Checksum mismatch: {path.name}')
         partial.replace(path)
@@ -184,15 +197,30 @@ def verify_host_imports(library, host_exports, host):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--skip-generator', action='store_true',
+                        help='Use .windows-deps/stage from the CI generator job')
+    args = parser.parse_args()
     if sys.platform != 'win32':
         raise SystemExit('Run this script in a native Windows x64 MSVC environment')
+    visual_studio = select_msvc()
+    if not args.skip_generator:
+        run(sys.executable, ROOT / 'ci/build-windows-generator.py')
+    generator_stage = ROOT / '.windows-deps/stage'
+    run(sys.executable, ROOT / 'ci/test-windows-generator.py', generator_stage,
+        ARTIFACTS / 'helper-runtime')
     ARTIFACTS.mkdir(parents=True, exist_ok=True)
     sdk, wx, wxlib, host_exports, pin = prepare_sdk()
     work = WORK / 'build'
     identity = os.environ.get('WEATHER_ROUTING_CI_XWEATHER', 'true').lower() == 'true'
     package = 'xweather_routing_pi' if identity else 'weather_routing_pi'
-    headers = os.environ.get('WEATHER_ROUTING_API_HEADER_VERSION', '1.21')
+    headers = os.environ.get('WEATHER_ROUTING_API_HEADER_VERSION', '1.22')
+    # Metadata is produced during configure, so clear prior output before it.
+    for pattern in (package + '-*.tar.gz', package + '-*.xml'):
+        for old in work.glob(pattern):
+            old.unlink()
     run('cmake', '-S', ROOT, '-B', work, '-G', 'Visual Studio 17 2022', '-A', 'x64',
+        '-DCMAKE_GENERATOR_INSTANCE=' + visual_studio,
         '-DCMAKE_SYSTEM_VERSION=10.0', '-DCMAKE_BUILD_TYPE=Release', '-DOCPN_BUILD_TEST=ON',
         '-DWEATHER_ROUTING_STANDALONE_API=ON',
         '-DWEATHER_ROUTING_API_HEADER_VERSION=' + headers,
@@ -201,6 +229,7 @@ def main():
         '-DWEATHER_ROUTING_WINDOWS_ZLIB_LIBRARY=' + str(sdk / 'z.lib'),
         '-DwxWidgets_ROOT_DIR=' + str(wx), '-DwxWidgets_LIB_DIR=' + str(wxlib),
         '-DWEATHER_ROUTING_EXPECTED_WX_VERSION=' + WX_VERSION,
+        '-DWEATHER_ROUTING_WINDOWS_GENERATOR_STAGE=' + str(generator_stage),
         '-DwxWidgets_CONFIGURATION=mswu', '-DCMAKE_CXX_FLAGS=/we4302 /we4311 /we4312')
     run('cmake', '--build', work, '--config', 'Release', '--parallel', '4',
         '--target', 'wr_wx_sdk_link_probe')
@@ -233,12 +262,37 @@ def main():
     run(sys.executable, ROOT / 'ci/embed-package-metadata.py', archives[0], metadata[0], archives[0])
     run(sys.executable, ROOT / 'ci/verify-shoreline-package.py', archives[0])
     with tarfile.open(archives[0]) as archive:
-        dlls = [m for m in archive.getmembers() if m.name.endswith('.dll')]
-        if len(dlls) != 1 or Path(dlls[0].name).name != package + '.dll':
-            raise RuntimeError('Package contains unexpected Windows libraries')
+        dlls = [m for m in archive.getmembers() if m.name.lower().endswith('.dll')]
+        plugins = [m for m in dlls if Path(m.name).name == package + '.dll']
+        if len(plugins) != 1:
+            raise RuntimeError('Package must contain exactly one plugin DLL')
+        for member in dlls:
+            if member not in plugins and '/plugins/' + package + '/bin/' not in member.name:
+                raise RuntimeError('Helper DLL outside its private directory: ' + member.name)
         image = WORK / (package + '.dll')
-        image.write_bytes(archive.extractfile(dlls[0]).read())
+        image.write_bytes(archive.extractfile(plugins[0]).read())
         verify_host_imports(image, host_exports, WORK / 'host')
+        packaged_helper = WORK / 'packaged-helper'
+        if packaged_helper.exists():
+            shutil.rmtree(packaged_helper)
+        marker = '/plugins/' + package + '/'
+        for member in archive.getmembers():
+            if not member.isfile() or marker not in member.name:
+                continue
+            relative = Path(member.name.split(marker, 1)[1])
+            if relative.is_absolute() or '..' in relative.parts:
+                raise RuntimeError('Unsafe package path: ' + member.name)
+            if relative.parts[0] in ('bin', 'runtime'):
+                target = packaged_helper / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(archive.extractfile(member).read())
+        (ARTIFACTS / 'package-size.json').write_text(json.dumps({
+            'archive_bytes': archives[0].stat().st_size,
+            'installed_file_bytes': sum(m.size for m in archive.getmembers() if m.isfile()),
+            'wx_version': WX_VERSION,
+        }, indent=2) + '\n')
+    run(sys.executable, ROOT / 'ci/test-windows-generator.py', packaged_helper,
+        ARTIFACTS / 'packaged-helper-runtime')
     destination = ARTIFACTS / 'package'
     destination.mkdir(exist_ok=True)
     for path in (archives[0], metadata[0]):
@@ -246,11 +300,23 @@ def main():
     (destination / 'SHA256SUMS').write_text('\n'.join(
         digest(path) + '  ' + path.name for path in sorted(destination.iterdir()) if path.name != 'SHA256SUMS') + '\n')
     shutil.copy2(work / 'CMakeCache.txt', ARTIFACTS)
-    run(sys.executable, ROOT / 'ci/test-installed-host.py', WORK / 'host/opencpn.exe',
-        WORK / 'host/opencpn-cmd.exe', archives[0], ARTIFACTS / 'normal-runtime',
-        '--host-version', pin['host_version'])
-    run(sys.executable, ROOT / 'ci/test-windows-host.py', WORK / 'host',
+    # Normal-profile import is deliberately restricted to disposable CI VMs.
+    # A developer's source build uses only the extracted portable test host.
+    if os.environ.get('GITHUB_ACTIONS') == 'true' or os.environ.get('CIRCLECI') == 'true':
+        run(sys.executable, ROOT / 'ci/test-installed-host.py', WORK / 'host/opencpn.exe',
+            WORK / 'host/opencpn-cmd.exe', archives[0], ARTIFACTS / 'normal-runtime',
+            '--host-version', pin['host_version'])
+    portable = WORK / 'portable-test'
+    if portable.exists():
+        shutil.rmtree(portable)
+    shutil.copytree(WORK / 'host', portable)
+    run(sys.executable, ROOT / 'ci/test-windows-host.py', portable,
         archives[0], ARTIFACTS / 'runtime', '--host-version', pin['host_version'])
+    launcher = WORK / 'launch-test.cmd'
+    launcher.write_text('@echo off\nset WR_OPEN_PASSAGE_PLANNER=1\n'
+                        'set WR_HEADLESS_ROUTE_TEST=\nset WR_HEADLESS_DATA_DIR=\n'
+                        'cd /d "' + str(portable) + '"\n"' + str(portable / 'opencpn.exe') + '" -p\n')
+    print('Build and isolated routing tests passed. Launch:', launcher, flush=True)
 
 
 if __name__ == '__main__':

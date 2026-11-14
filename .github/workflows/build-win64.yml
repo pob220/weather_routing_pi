@@ -4,131 +4,175 @@ on:
   workflow_dispatch:
   push:
     paths:
+      - '.gitattributes'
       - 'CMakeLists.txt'
-      - 'vcpkg.json'
-      - 'opencpn-importlibs/**'
+      - 'cmake/**'
+      - 'ci/**'
+      - 'third_party/**'
+      - 'opencpn-libs'
       - '.github/workflows/build-win64.yml'
       - 'src/**'
       - 'include/**'
+      - 'test/**'
       - 'data/**'
+      - 'vendor/**'
   pull_request:
-    paths:
-      - 'CMakeLists.txt'
-      - 'vcpkg.json'
-      - 'opencpn-importlibs/**'
-      - '.github/workflows/build-win64.yml'
-      - 'src/**'
-      - 'include/**'
-      - 'data/**'
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  WEATHER_ROUTING_CI_XWEATHER: ${{ endsWith(github.repository, '/xweather_routing_pi') }}
+
+concurrency:
+  group: windows-v2-${{ github.ref }}
+  # Let a cold scientific dependency build finish and save its binary cache.
+  cancel-in-progress: false
 
 jobs:
-  build-win64:
+  generator:
     runs-on: windows-2022
-
+    timeout-minutes: 180
     env:
-      VCPKG_TARGET_TRIPLET: x64-windows
-
+      VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/.windows-deps/binary-cache,readwrite
+      VCPKG_DISABLE_METRICS: '1'
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-
-      - name: Cache import libraries
-        uses: actions/cache@v4
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
         with:
-          path: opencpn-importlibs/x64
-          key: opencpn-importlibs-x64
-
-      - name: MSVC dev cmd
-        uses: ilammy/msvc-dev-cmd@v1
+          python-version: '3.12'
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: github.ref != 'refs/heads/feature/xweather-2.2.0'
         with:
           arch: x64
+          vsversion: '2022'
+      - uses: actions/cache/restore@v4
+        if: github.ref != 'refs/heads/feature/xweather-2.2.0'
+        id: dependencies
+        with:
+          path: |
+            .windows-deps/binary-cache
+            .windows-deps/vcpkg/downloads
+          key: wr-v2-msvc2022-release-${{ hashFiles('ci/windows-generator/vcpkg.json', 'ci/vcpkg-triplets/**', 'ci/vcpkg-overlay-ports/**') }}
+      - name: Prepare scientific dependencies
+        if: github.ref != 'refs/heads/feature/xweather-2.2.0'
+        run: python ci/build-windows-generator.py --dependencies-only
+      - uses: actions/cache/save@v4
+        if: always() && github.ref != 'refs/heads/feature/xweather-2.2.0' && steps.dependencies.outputs.cache-hit != 'true'
+        with:
+          path: |
+            .windows-deps/binary-cache
+            .windows-deps/vcpkg/downloads
+          key: ${{ steps.dependencies.outputs.cache-primary-key }}
+      - name: Build, test and stage independent GRIB helper
+        if: github.ref != 'refs/heads/feature/xweather-2.2.0'
+        run: python ci/build-windows-generator.py
+      # This UI-only pass does not rebuild the unchanged scientific helper.
+      # Fail rather than reuse it if its source or build inputs have changed.
+      - name: Verify unchanged helper inputs
+        if: github.ref == 'refs/heads/feature/xweather-2.2.0'
+        shell: pwsh
+        run: |
+          git diff --exit-code 743c443a5029edbb4c40272ed0861b2f58e4a789 HEAD -- third_party/environmental-grib-generator ci/windows-generator ci/vcpkg-overlay-ports ci/vcpkg-triplets ci/build-windows-generator.py ci/windows_build_tools.py
+          if ($LASTEXITCODE -ne 0) { throw 'Helper inputs changed; rebuild and qualify the scientific helper before reuse' }
+      - name: Retrieve qualified unchanged helper
+        if: github.ref == 'refs/heads/feature/xweather-2.2.0'
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: 42409887075
+          name: windows-generator-stage
+          path: .windows-deps/stage
+      - name: Verify staged helper source provenance
+        if: github.ref == 'refs/heads/feature/xweather-2.2.0'
+        shell: python
+        run: |
+          import hashlib, json
+          from pathlib import Path
+          source = Path('third_party/environmental-grib-generator')
+          staged = json.loads(Path('.windows-deps/stage/runtime/stage.json').read_text())
+          actual = {p.relative_to(source).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for p in source.rglob('*') if p.is_file()}
+          # The 2.2 freeze checks out exact LF repository bytes. The previously
+          # qualified Windows helper recorded core.autocrlf's CRLF checkout.
+          # Require the original per-file hashes after only that conversion.
+          qualified_crlf = {p.relative_to(source).as_posix(): hashlib.sha256(p.read_bytes().replace(b'\r\n', b'\n').replace(b'\n', b'\r\n')).hexdigest() for p in source.rglob('*') if p.is_file()}
+          if actual != staged['source_sha256'] and qualified_crlf != staged['source_sha256']:
+              raise RuntimeError('Qualified helper source hashes do not match this checkout')
+          print('Using unchanged helper qualified by native run 42409887075; packaged runtime checks run again with each new plugin')
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-generator-stage
+          include-hidden-files: true
+          path: |
+            .windows-deps/stage/bin
+            .windows-deps/stage/runtime
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-generator-checks
+          include-hidden-files: true
+          path: |
+            .windows-deps/logs
+            .windows-deps/build/CMakeCache.txt
 
+  build-win64:
+    needs: generator
+    runs-on: windows-2022
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        wx: ['3.3.4', '3.2.9']
+    env:
+      WEATHER_ROUTING_WINDOWS_WX_VERSION: ${{ matrix.wx }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+          vsversion: '2022'
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-generator-stage
+          path: .windows-deps/stage
+      - uses: actions/cache@v4
+        with:
+          path: |
+            .windows64/cache
+            .windows64-wx329/cache
+          key: wr-sdk-${{ matrix.wx }}-${{ hashFiles('ci/*sdk.json') }}
       - name: Install gettext tools
         shell: pwsh
         run: |
-          choco install gettext -y --no-progress
-          if ($LASTEXITCODE -ne 0) {
-            Start-Sleep -Seconds 10
-            choco install gettext -y --no-progress
-          }
-          if ($LASTEXITCODE -ne 0) { throw "Chocolatey could not install gettext" }
-
-          $gettextBinCandidates = @(
-            "C:\Program Files\gettext-iconv\bin",
-            "C:\Program Files (x86)\gettext-iconv\bin",
-            "C:\ProgramData\chocolatey\lib\gettext\tools\bin",
-            "C:\ProgramData\chocolatey\lib\gettext\tools\gettext-iconv\bin"
-          )
-
-          $gettextBin = $gettextBinCandidates |
-            Where-Object { Test-Path "$_\msgfmt.exe" } |
-            Select-Object -First 1
-
-          if (-not $gettextBin) { throw "msgfmt.exe not found" }
-
-          $env:PATH = "$gettextBin;$env:PATH"
-          $gettextBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-
-      - name: Prepare vcpkg
-        uses: lukka/run-vcpkg@v11
+          choco install gettext --version 1.0.0.20260310 -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw "GNU gettext installation failed" }
+          "C:\Program Files\gettext-iconv\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Build, package and test matched OpenCPN host
+        run: python ci/circleci-build-windows64.py --skip-generator
+      - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          runVcpkgInstall: true
-          vcpkgJsonGlob: vcpkg.json
+          name: xWeatherRouting-2.2.0-windows-x64-wx${{ matrix.wx }}
+          include-hidden-files: true
+          path: |
+            artifacts/windows-x64
+            compatibility/windows-x64-wx329
+            .windows64/build/Testing/Temporary
+            .windows64-wx329/build/Testing/Temporary
 
-      - name: Configure
-        shell: pwsh
-        run: |
-          cmake -S . -B build-win64 `
-            -G "Visual Studio 17 2022" -A x64 -T v143 `
-            -DOCPN_TARGET=MSVC `
-            -DVCPKG_TARGET_TRIPLET=x64-windows `
-            -DWEATHER_ROUTING_WINDOWS_IMPORT_LIBRARY="${env:GITHUB_WORKSPACE}/opencpn-importlibs/x64/opencpn.lib" `
-            -DWEATHER_ROUTING_WINDOWS_ZLIB_LIBRARY="${env:GITHUB_WORKSPACE}/opencpn-importlibs/x64/zlib.lib" `
-            -DCMAKE_TOOLCHAIN_FILE="${env:VCPKG_ROOT}\scripts\buildsystems\vcpkg.cmake"
-
-      - name: Build
-        shell: pwsh
-        run: |
-          cmake --build build-win64 --config RelWithDebInfo --target package
-
-      - name: Inject metadata.xml
-        shell: pwsh
-        run: |
-          $pluginRoot = (Get-Location).Path
-          $buildDir = Join-Path $pluginRoot "build-win64"
-          $pluginName = Split-Path $pluginRoot -Leaf
-
-          $xmlFile = Get-ChildItem -Path $buildDir -Filter "$pluginName-*.xml" | Select-Object -First 1
-          $tarball = Get-ChildItem -Path $buildDir -Filter "$pluginName-*.tar.gz" | Select-Object -First 1
-
-          if (-not $xmlFile) { throw "metadata.xml not found" }
-          if (-not $tarball) { throw "tarball not found" }
-
-          $innerTar = Join-Path $buildDir "inner.tar"
-          & gzip -d -c $tarball.FullName > $innerTar
-
-          $repackDir = Join-Path $buildDir "repack"
-          if (Test-Path $repackDir) { Remove-Item -Recurse -Force $repackDir }
-          New-Item -ItemType Directory -Path $repackDir | Out-Null
-          & tar -xf $innerTar -C $repackDir
-
-          Copy-Item $xmlFile.FullName (Join-Path $repackDir "metadata.xml") -Force
-
-          $pluginDir = Get-ChildItem $repackDir | Where-Object { $_.Name -match $pluginName } | Select-Object -First 1
-          if (-not $pluginDir) { throw "Plugin directory not found" }
-
-          $innerName = $tarball.FullName -replace ".gz",""
-          & tar -cf $innerName -C $repackDir metadata.xml $($pluginDir.Name)
-
-          & gzip -c $innerName > $tarball.FullName
-
-          Remove-Item $innerName -Force
-          Remove-Item $innerTar -Force
-          Remove-Item $repackDir -Recurse -Force
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-win64-rdeb-package
-          path: build-win64/**
+  ui-trial:
+    if: endsWith(github.repository, '/xweather_routing_pi')
+    needs: build-win64
+    uses: ./.github/workflows/windows-ui-trial.yml
+    with:
+      qualification-run: ${{ format('{0}', github.run_id) }}
+      source-commit: ${{ github.sha }}

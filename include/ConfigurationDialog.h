@@ -55,6 +55,9 @@ public:
   ~ConfigurationDialog();
 
   void EditBoat();
+  void ShowSettingsSection(size_t section) {
+    if (section < m_notebook7->GetPageCount()) m_notebook7->SetSelection(section);
+  }
 #ifdef __OCPN__ANDROID__
   void ShowAndroidSection(size_t section);
   void SetAndroidEndpoint(bool start, const wxString& name);
@@ -140,6 +143,7 @@ protected:
     event.Skip();
   }
   void EnableSpinDouble(wxMouseEvent& event) {
+
     event.Skip();
   }
   void OnStartFromBoat(wxCommandEvent& event);
@@ -157,7 +161,7 @@ protected:
   void OnGenerateDegreeSteps(wxCommandEvent& event);
   void UpdateChartSafetyRamLabel();
   void UpdateRoutingTimeModeControls();
-  void OnClose(wxCommandEvent& event) { Hide(); }
+  void OnClose(wxCommandEvent& event) { SaveWindowGeometry(); Hide(); }
 
 private:
 #ifdef __OCPN__ANDROID__
@@ -172,6 +176,13 @@ private:
   wxCheckBox* m_cbAutomaticAdaptiveSettings = nullptr;
   bool HandleEngineEdit(wxObject* control);
   void RefreshEnginePresetStatus();
+  void BuildCompactPlanningControls();
+  void RefreshCompactPlanningStatus();
+  void SaveWindowGeometry();
+  void ResetWeatherLimits();
+  wxStaticText* m_compactEngineStatus = nullptr;
+  wxStaticText* m_compactSafetyStatus = nullptr;
+  bool m_compactReady = false;
 
   void SetStartDateTime(wxDateTime datetime);
 

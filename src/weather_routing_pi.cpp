@@ -44,6 +44,8 @@
 #include "Utilities.h"
 #include "ChartSafetyHost.h"
 #include "ClimatologyCompatibility.h"
+#include "BundledClimatology.h"
+
 #include "Boat.h"
 #include "RoutePoint.h"
 #include "RouteMap.h"
@@ -53,6 +55,11 @@
 #include "WeatherRouting.h"
 #include "WeatherDataProvider.h"
 #include "weather_routing_pi.h"
+
+static bool OpenPassagePlannerRequested() {
+  wxString value;
+  return wxGetEnv("WR_OPEN_PASSAGE_PLANNER", &value) && value == "1";
+}
 
 static_assert(API_VERSION_MINOR == WEATHER_ROUTING_API_HEADER_MINOR,
               "The selected stock API headers were not used");
@@ -255,12 +262,12 @@ int weather_routing_pi::Init() {
   wxMenu dummy_menu;
   m_position_menu_id = AddCanvasContextMenuItem(
       new wxMenuItem(&dummy_menu, -1, _("Weather Route Position")), this);
-  SetCanvasMenuItemViz(m_position_menu_id, false);
+  SetCanvasMenuItemViz(m_position_menu_id, true);
 
   m_waypoint_menu_id = AddCanvasMenuItem(
       new wxMenuItem(&dummy_menu, -1, _("Weather Route Position")), this,
       "Waypoint");
-  SetCanvasMenuItemViz(m_waypoint_menu_id, false, "Waypoint");
+  SetCanvasMenuItemViz(m_waypoint_menu_id, true, "Waypoint");
 
   m_route_menu_id = AddCanvasMenuItem(
       new wxMenuItem(&dummy_menu, -1, _("Weather Route Analysis")), this,
@@ -512,8 +519,18 @@ void weather_routing_pi::SetPluginMessage(wxString& message_id,
   } else if (message_id == _T("CLIMATOLOGY")) {
     if (!m_pWeather_Routing) return; /* not ready */
 
-    const auto api = weather_routing::ReadClimatologyMessage(
+    // A provider change must not invalidate callbacks used by active workers.
+    const auto advertised = weather_routing::ReadClimatologyMessage(
         std::string(message_body.ToUTF8()));
+    const auto api = weather_routing::BundledClimatology::Resolve(advertised);
+    const bool changed=api.data!=RouteMap::ClimatologyData ||
+        api.wind_atlas!=RouteMap::ClimatologyWindAtlasData ||
+        api.cyclones!=RouteMap::ClimatologyCycloneTrackCrossings ||
+        m_climatology_dataset!=wxString::FromUTF8(api.dataset.c_str());
+    if (changed && (!m_pWeather_Routing->m_RunningRouteMaps.empty() ||
+        !m_pWeather_Routing->m_WaitingRouteMaps.empty())) {
+      m_pWeather_Routing->CancelExternalPlanningScenario();
+    }
     {
       std::lock_guard<std::recursive_mutex> lock(
           ClimatologyThreadGuard::InvocationMutex());
@@ -522,7 +539,8 @@ void weather_routing_pi::SetPluginMessage(wxString& message_id,
       RouteMap::ClimatologyData = api.data;
       RouteMap::ClimatologyWindAtlasData = api.wind_atlas;
       RouteMap::ClimatologyCycloneTrackCrossings = api.cyclones;
-      WeatherDataProvider::ResetClimatologyPreparation();
+      m_climatology_dataset=wxString::FromUTF8(api.dataset.c_str());
+      if(changed)WeatherDataProvider::ResetClimatologyPreparation();
     }
 
     if (m_pWeather_Routing) {
@@ -640,7 +658,7 @@ class RouteCheckFixtureMutation : public wxTimer {
     if (action_ == "remove") {
       DeletePlugInRoute(guid_);
     } else if (auto route = GetRoute_Plugin(guid_)) {
-      if (action_ == "rename") route->m_NameString += " — edited";
+      if (action_ == "rename") route->m_NameString += L" — edited";
       else if (route->pWaypointList && route->pWaypointList->GetFirst())
         route->pWaypointList->GetFirst()->GetData()->m_lon += .001;
       UpdatePlugInRoute(route.get());
@@ -749,7 +767,7 @@ public:
       wxTheApp->ExitMainLoop();
       return;
     }
-    if (mode.IsSameAs("open-only", false)) {
+    if (mode.IsSameAs("open-only", false) || OpenPassagePlannerRequested()) {
       plugin->m_pWeather_Routing->Show(true);
       wxLogMessage("WR_HEADLESS_ROUTE_TEST open_only ready");
       return;
@@ -766,7 +784,8 @@ private:
 void weather_routing_pi::MaybeStartHeadlessRouteTest() {
   const char* enabled = getenv("WR_HEADLESS_ROUTE_TEST");
   const char* scenario = getenv("WR_HEADLESS_SCENARIO");
-  if ((!enabled || !*enabled) && (!scenario || !*scenario)) return;
+  if ((!enabled || !*enabled) && (!scenario || !*scenario) &&
+      !OpenPassagePlannerRequested()) return;
   if ((!enabled || !*enabled) && scenario && *scenario)
     wxSetEnv("WR_HEADLESS_ROUTE_TEST", "scenario");
 
@@ -786,6 +805,14 @@ void weather_routing_pi::MaybeStartHeadlessRouteTest() {
 
 void weather_routing_pi::NewWR() {
   if (m_pWeather_Routing) return;
+
+  weather_routing::BundledClimatology::Configure(GetPluginDataDir(PLUGIN_PACKAGE_NAME)+"/data/climatology");
+  const auto climatology = weather_routing::BundledClimatology::Resolve();
+  m_climatology_dataset=wxString::FromUTF8(climatology.dataset.c_str());
+  RouteMap::ClimatologyData=climatology.data;
+  RouteMap::ClimatologyWindAtlasData=climatology.wind_atlas;
+  RouteMap::ClimatologyCycloneTrackCrossings=climatology.cyclones;
+  WeatherDataProvider::ResetClimatologyPreparation();
 
   m_pWeather_Routing = new WeatherRouting(m_parent_window, *this);
   wxPoint p = m_pWeather_Routing->GetPosition();
@@ -860,9 +887,11 @@ void weather_routing_pi::OnContextMenuItemCallback(int id) {
     wxString GUID = GetSelectedRouteGUID_Plugin();
     wxLogMessage("WeatherRouting multi-leg selected route: route=%s", GUID);
     m_pWeather_Routing->CreateMultiLegConfigurationsFromRoute(GUID);
+    m_pWeather_Routing->Show(true);
     return;
   }
-  m_pWeather_Routing->Reset();
+  m_pWeather_Routing->RefreshPassageSelection();
+  m_pWeather_Routing->Show(true);
 }
 
 void weather_routing_pi::StartRouteSafetyCheck(const wxString& route_guid,
@@ -875,7 +904,7 @@ void weather_routing_pi::StartRouteSafetyCheck(const wxString& route_guid,
     margin = config.SafetyMarginLand;
   }
   const auto old_path = m_pconfig->GetPath();
-  m_pconfig->SetPath("/PlugIns/WeatherRouting/RouteCheck");
+  m_pconfig->SetPath("/PlugIns/xWeatherRouting2/RouteCheck");
   m_pconfig->Read("MinimumDepthM", &depth, depth);
   m_pconfig->Read("LandMarginNM", &margin, margin);
   m_pconfig->SetPath(old_path);
@@ -984,7 +1013,7 @@ bool weather_routing_pi::LoadConfig() {
 
   if (!pConf) return false;
 
-  pConf->SetPath(_T( "/PlugIns/WeatherRouting" ));
+  pConf->SetPath(_T( "/PlugIns/xWeatherRouting2" ));
   pConf->Read(_T("UsePersistentCertifiedSafeAreaCache"),
               &m_use_persistent_chart_safe_cache, true);
   long ram_mib = 0;
@@ -1072,7 +1101,7 @@ bool weather_routing_pi::SaveConfig() {
 
   if (!pConf) return false;
 
-  pConf->SetPath(_T ( "/PlugIns/WeatherRouting" ));
+  pConf->SetPath(_T ( "/PlugIns/xWeatherRouting2" ));
   pConf->Write(_T("UsePersistentCertifiedSafeAreaCache"),
                m_use_persistent_chart_safe_cache);
   pConf->Write(_T("ChartSafetyRamCacheMiB"),
@@ -1533,7 +1562,10 @@ wxString weather_routing_pi::StandardPath() {
   wxString testDataDir;
   if (wxGetEnv("WR_HEADLESS_DATA_DIR", &testDataDir) && !testDataDir.empty()) {
     wxFileName directory = wxFileName::DirName(testDataDir);
-    if (directory.IsAbsolute()) return directory.GetPathWithSep();
+    if (directory.IsAbsolute()) {
+      directory.Mkdir(wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL);
+      return directory.GetPathWithSep();
+    }
   }
   wxString s = wxFileName::GetPathSeparator();
   wxString stdPath = *GetpPrivateApplicationDataLocation();
@@ -1541,7 +1573,7 @@ wxString weather_routing_pi::StandardPath() {
   stdPath += s + _T("plugins");
   if (!wxDirExists(stdPath)) wxMkdir(stdPath);
 
-  stdPath += s + _T("weather_routing");
+  stdPath += s + _T("xweather_routing_v2");
 
 #ifdef __WXOSX__
   // Compatibility with pre-OCPN-4.2; move config dir to
@@ -1551,7 +1583,7 @@ wxString weather_routing_pi::StandardPath() {
     wxString s = wxFileName::GetPathSeparator();
     // should be ~/Library/Preferences/opencpn
     wxString oldPath = (std_path.GetUserConfigDir() + s + _T("plugins") + s +
-                        _T("weather_routing"));
+                        _T("xweather_routing_v2"));
     if (wxDirExists(oldPath) && !wxDirExists(stdPath)) {
       wxLogMessage("weather_routing_pi: moving config dir %s to %s", oldPath,
                    stdPath);
@@ -1568,8 +1600,8 @@ wxString weather_routing_pi::StandardPath() {
 
 void weather_routing_pi::ShowMenuItems(bool show) {
   SetToolbarItemState(m_leftclick_tool_id, show);
-  SetCanvasMenuItemViz(m_position_menu_id, show);
-  SetCanvasMenuItemViz(m_waypoint_menu_id, show, "Waypoint");
+  SetCanvasMenuItemViz(m_position_menu_id, true);
+  SetCanvasMenuItemViz(m_waypoint_menu_id, true, "Waypoint");
   // SetCanvasMenuItemViz(m_route_menu_id, show, "Route");
   // Route context actions remain registered and visible while the plugin is
   // active. Toggling them here can leave one route action hidden after the

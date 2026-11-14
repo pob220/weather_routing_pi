@@ -1,0 +1,10 @@
+[
+ {"name":"short-open-water","start":[30,-140],"east_nm":20,"wind_from":0},
+ {"name":"upwind-tacking","start":[30,-140],"east_nm":0,"north_nm":30,"wind_from":0},
+ {"name":"long-ocean","start":[30,-140],"east_nm":800,"wind_from":0,"max_hours":240},
+ {"name":"changing-wind","start":[30,-140],"east_nm":120,"north_nm":20,"wind_from":20,"variable":true,"max_hours":96},
+ {"name":"island-detour","start":[30,-140],"east_nm":40,"wind_from":0,"rectangles_nm":[[12,-4,20,4]]},
+ {"name":"date-line","start":[30,179.5],"east_nm":120,"wind_from":0,"max_hours":96},
+ {"name":"blocked-weather","start":[30,-140],"east_nm":20,"wind_speed":60,"max_wind":30},
+ {"name":"coincident-endpoints","start":[30,-140],"end":[30,-140],"wind_from":0}
+]

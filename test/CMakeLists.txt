@@ -47,6 +47,10 @@ set(TEST_SRC
     AdaptiveHeaders_compile.cpp
     ${WEATHER_ROUTING_SOURCE_DIR}/src/engine/adaptive/Quick2.cpp
     ${WEATHER_ROUTING_SOURCE_DIR}/src/engine/adaptive/StandardRecovery.cpp
+    NewPassageEnginePreferences_tests.cpp
+    PlanningPresentation_tests.cpp
+    ${WEATHER_ROUTING_SOURCE_DIR}/src/PlanningHelp.cpp
+    ${WEATHER_ROUTING_SOURCE_DIR}/src/RunDiagnosticsJournal.cpp
     RouteWaypointValidation_tests.cpp
     ${WEATHER_ROUTING_SOURCE_DIR}/src/RouteWaypointValidation.cpp
     RouteDiagnostics_tests.cpp
@@ -97,6 +101,22 @@ set(TEST_SRC
     RoutingFootprint_tests.cpp
     ClimatologyThreadGuard_tests.cpp
     ClimatologyCompatibility_tests.cpp
+    PassageWeather_tests.cpp
+    PassageWeatherRequest_tests.cpp
+    ${WEATHER_ROUTING_SOURCE_DIR}/src/PassageWeatherRequest.cpp
+    PassagePresentation_tests.cpp
+    ${WEATHER_ROUTING_SOURCE_DIR}/src/PassagePresentation.cpp
+    PassageReadiness_tests.cpp
+    PassageSettings_tests.cpp
+    ${WEATHER_ROUTING_SOURCE_DIR}/src/PassageSettings.cpp
+    ${WEATHER_ROUTING_SOURCE_DIR}/src/PassageReadiness.cpp
+    ${WEATHER_ROUTING_SOURCE_DIR}/src/PassageWeather.cpp
+    ${WEATHER_ROUTING_SOURCE_DIR}/src/BundledClimatology.cpp
+    ${WEATHER_ROUTING_SOURCE_DIR}/src/ClimatologyMath.cpp
+    ${WEATHER_ROUTING_SOURCE_DIR}/src/GribReader.cpp
+    ${WEATHER_ROUTING_SOURCE_DIR}/src/GribV1Record.cpp
+    ${WEATHER_ROUTING_SOURCE_DIR}/src/GribV2Record.cpp
+    ${WEATHER_ROUTING_SOURCE_DIR}/src/GribRecord.cpp
     ${WEATHER_ROUTING_SOURCE_DIR}/src/ClimatologyCompatibility.cpp
     ConstraintTime_tests.cpp
     SunCalculator_tests.cpp
@@ -149,6 +169,10 @@ set(TEST_SRC
    )
 
    add_executable(weather_routing_pi_tests ${TEST_SRC})
+   if(TARGET libjasper)
+     target_link_libraries(weather_routing_pi_tests PRIVATE libjasper)
+     target_compile_definitions(weather_routing_pi_tests PRIVATE JASPER)
+   endif()
    target_compile_definitions(weather_routing_pi_tests PRIVATE
        WR_TEST_SHORELINE_DATA="${WEATHER_ROUTING_SOURCE_DIR}/data/shoreline")
 
@@ -258,6 +282,9 @@ set(TEST_SRC
 # register the executable as one aggregate test: that reruns the complete
 # suite, and the duplicate process can exceed CTest's default timeout on the
 # supported 32-bit Windows executor even though every discovered case passes.
+add_test(NAME weather_routing_2_2_engine_freeze
+    COMMAND ${CMAKE_COMMAND} -DSOURCE_ROOT=${WEATHER_ROUTING_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_LIST_DIR}/FrozenEngines2_2.cmake)
 add_test(
     NAME weather_routing_time_zone_lifecycle_contract
     COMMAND ${CMAKE_COMMAND}
@@ -317,3 +344,13 @@ if(WIN32)
             "$<TARGET_FILE_DIR:partial_routes_qt_macro_tests>")
 endif()
 gtest_discover_tests(partial_routes_qt_macro_tests DISCOVERY_MODE PRE_TEST)
+
+# Opt-in real date/clock widget checks. Kept outside the display-free CTest
+# suite; run this target in a private GUI session (or native Windows runner).
+add_executable(planning_time_gui_tests EXCLUDE_FROM_ALL
+    PlanningTimeCtrl_gui.cpp
+    ${WEATHER_ROUTING_SOURCE_DIR}/src/PlanningTimeCtrl.cpp
+    ${WEATHER_ROUTING_SOURCE_DIR}/src/TimeZoneDisplay.cpp)
+target_include_directories(planning_time_gui_tests PRIVATE
+    ${WEATHER_ROUTING_SOURCE_DIR}/include)
+target_link_libraries(planning_time_gui_tests PRIVATE ${wxWidgets_LIBRARIES})

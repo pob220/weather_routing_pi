@@ -1,0 +1,1560 @@
+#include "environmental_grib/grib.h"
+#include "environmental_grib/preflight.h"
+
+#include <eccodes.h>
+
+#include <algorithm>
+#include <array>
+#include <cerrno>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <fstream>
+#include <iomanip>
+#include <limits>
+#include <memory>
+#include <optional>
+#include <set>
+#include <sstream>
+#include <system_error>
+
+#include "environmental_grib/error.h"
+#include "environmental_grib/cancellation.h"
+#include "environmental_grib/geo.h"
+#include "environmental_grib/platform.h"
+
+namespace environmental_grib {
+namespace {
+
+using HandlePtr = std::unique_ptr<codes_handle, decltype(&codes_handle_delete)>;
+
+std::vector<unsigned char> ReadBytes(const std::filesystem::path& path) {
+  std::ifstream stream(path, std::ios::binary | std::ios::ate);
+  if (!stream) throw ValidationError("unable to read file: " + PathToUtf8(path));
+  const auto end = stream.tellg();
+  if (end < 0)
+    throw ValidationError("unable to determine file size: " + PathToUtf8(path));
+  std::vector<unsigned char> bytes(static_cast<std::size_t>(end));
+  stream.seekg(0);
+  if (!bytes.empty() &&
+      !stream.read(reinterpret_cast<char*>(bytes.data()), end)) {
+    throw ValidationError("unable to read file: " + PathToUtf8(path));
+  }
+  return bytes;
+}
+
+std::uint64_t ReadBigEndian(const unsigned char* value, std::size_t size) {
+  std::uint64_t result = 0;
+  for (std::size_t i = 0; i < size; ++i) result = (result << 8U) | value[i];
+  return result;
+}
+
+std::size_t MessageLengthAt(std::span<const unsigned char> data,
+                            std::size_t offset) {
+  if (offset + 8 > data.size())
+    throw ValidationError("truncated GRIB header at byte offset " +
+                          std::to_string(offset));
+  const unsigned edition = data[offset + 7];
+  if (edition == 1)
+    return static_cast<std::size_t>(ReadBigEndian(data.data() + offset + 4, 3));
+  if (edition == 2) {
+    if (offset + 16 > data.size())
+      throw ValidationError("truncated GRIB2 header at byte offset " +
+                            std::to_string(offset));
+    const auto length = ReadBigEndian(data.data() + offset + 8, 8);
+    if (length > std::numeric_limits<std::size_t>::max())
+      throw ValidationError("GRIB message length exceeds platform limits");
+    return static_cast<std::size_t>(length);
+  }
+  throw ValidationError("unsupported GRIB edition " + std::to_string(edition) +
+                        " at byte offset " + std::to_string(offset));
+}
+
+void ValidateMessage(std::span<const unsigned char> data, std::size_t offset,
+                     std::size_t length) {
+  if (length == 0 || length > data.size() - offset) {
+    throw ValidationError("invalid GRIB message length " +
+                          std::to_string(length) + " at byte offset " +
+                          std::to_string(offset));
+  }
+  if (length < 4 ||
+      std::memcmp(data.data() + offset + length - 4, "7777", 4) != 0) {
+    throw ValidationError(
+        "GRIB terminator not found for message at byte offset " +
+        std::to_string(offset));
+  }
+}
+
+void Check(int error, const std::string& operation) {
+  if (error != 0)
+    throw ValidationError(operation + ": " + codes_get_error_message(error));
+}
+
+void SetLong(codes_handle* handle, const char* key, long value) {
+  Check(codes_set_long(handle, key, value), std::string("setting ") + key);
+}
+
+void SetDouble(codes_handle* handle, const char* key, double value) {
+  Check(codes_set_double(handle, key, value), std::string("setting ") + key);
+}
+
+void SetString(codes_handle* handle, const char* key,
+               const std::string& value) {
+  std::size_t size = value.size();
+  Check(codes_set_string(handle, key, value.c_str(), &size),
+        std::string("setting ") + key);
+}
+
+std::optional<long> GetLong(codes_handle* handle, const char* key) {
+  long value = 0;
+  return codes_get_long(handle, key, &value) == 0 ? std::optional<long>{value}
+                                                  : std::nullopt;
+}
+
+std::optional<TimePoint> ValidityTime(codes_handle* handle) {
+  const auto date = GetLong(handle, "validityDate");
+  const auto time = GetLong(handle, "validityTime");
+  if (!date || !time) return std::nullopt;
+  const int year = static_cast<int>(*date / 10000);
+  const int month = static_cast<int>((*date / 100) % 100);
+  const int day = static_cast<int>(*date % 100);
+  const int hour = static_cast<int>(*time / 100);
+  const int minute = static_cast<int>(*time % 100);
+  char value[32];
+  std::snprintf(value, sizeof(value), "%04d-%02d-%02dT%02d:%02d:00Z", year,
+                month, day, hour, minute);
+  return ParseUtcDateTime(value);
+}
+
+std::optional<double> GetDouble(codes_handle* handle, const char* key) {
+  double value = 0.0;
+  return codes_get_double(handle, key, &value) == 0
+             ? std::optional<double>{value}
+             : std::nullopt;
+}
+
+std::optional<std::string> GetString(codes_handle* handle, const char* key) {
+  std::array<char, 512> value{};
+  std::size_t size = value.size();
+  return codes_get_string(handle, key, value.data(), &size) == 0
+             ? std::optional<std::string>{value.data()}
+             : std::nullopt;
+}
+
+double NormalizeLongitude(double value) {
+  double normalized = std::fmod(value + 180.0, 360.0);
+  if (normalized < 0.0) normalized += 360.0;
+  normalized -= 180.0;
+  return normalized == -180.0 && value > 0.0 ? 180.0 : normalized;
+}
+
+// Return an eastward, unwrapped interval. Endpoints alone are not bounds:
+// ECMWF's 1440-column global grid starts at 180 and ends at 179.75.
+std::pair<double, double> LongitudeExtent(codes_handle* handle, double first,
+                                          double last) {
+  const auto type = GetString(handle, "gridType").value_or("");
+  if (type != "regular_ll" && type != "regular_gg") {
+    // Projected/rotated grids do not express their i increment in geographic
+    // longitude. Retain the existing endpoint envelope for those grids.
+    return std::minmax(NormalizeLongitude(first), NormalizeLongitude(last));
+  }
+  const bool negative = GetLong(handle, "iScansNegatively").value_or(0) != 0;
+  double span = std::fmod((negative ? first - last : last - first) + 720.0,
+                          360.0);
+  const auto ni = GetLong(handle, "Ni");
+  const auto increment = GetDouble(handle, "iDirectionIncrementInDegrees");
+  constexpr double tolerance = 1e-5;
+  if (ni && *ni > 1 && increment && std::isfinite(*increment) &&
+      *increment > 0 && *increment <= 360.0) {
+    const double grid_span = (*ni - 1) * *increment;
+    if (grid_span <= 360.0 + tolerance) {
+      // A cyclic grid need not repeat its first column at the end.
+      if (grid_span + *increment >= 360.0 - tolerance)
+        return {-180.0, 180.0};
+      span = grid_span;
+    }
+  }
+  double west = NormalizeLongitude(negative ? first - span : first);
+  if (west == 180.0) west = -180.0;
+  return {west, west + span};
+}
+
+void Increment(Json::Value& object, const std::string& key) {
+  object[key] = object.get(key, 0).asUInt64() + 1;
+}
+
+std::optional<std::vector<double>> GetValues(codes_handle* handle) {
+  std::size_t size = 0;
+  if (codes_get_size(handle, "values", &size) != 0) return std::nullopt;
+  std::vector<double> values(size);
+  if (codes_get_double_array(handle, "values", values.data(), &size) != 0)
+    return std::nullopt;
+  values.resize(size);
+  return values;
+}
+
+std::optional<std::string> ValidityString(codes_handle* handle) {
+  const auto date = GetLong(handle, "validityDate");
+  const auto time = GetLong(handle, "validityTime");
+  if (!date || !time) return std::nullopt;
+  std::ostringstream value;
+  value << std::setw(8) << std::setfill('0') << *date << "T" << std::setw(4)
+        << std::setfill('0') << *time;
+  return value.str();
+}
+
+void AddStringArray(Json::Value& destination,
+                    const std::vector<std::string>& values) {
+  for (const auto& value : values) destination.append(value);
+}
+
+std::vector<std::string> ObjectKeys(const Json::Value& object) {
+  std::vector<std::string> result;
+  for (const auto& name : object.getMemberNames()) result.push_back(name);
+  return result;
+}
+
+std::filesystem::path TemporarySibling(const std::filesystem::path& output) {
+  for (unsigned attempt = 0; attempt < 1000; ++attempt) {
+    auto candidate = output;
+    candidate += "." + std::to_string(ProcessId()) + "." +
+                 std::to_string(attempt) + ".tmp";
+    if (!std::filesystem::exists(candidate)) return candidate;
+  }
+  throw ValidationError("unable to allocate temporary output beside " +
+                        PathToUtf8(output));
+}
+
+}  // namespace
+
+GribScanResult ScanGribMessages(const std::filesystem::path& path) {
+  // Check framing without holding a whole forecast in memory. Individual
+  // fields are decoded later, one at a time, by ecCodes.
+  std::ifstream input(path, std::ios::binary | std::ios::ate);
+  if (!input) throw ValidationError("unable to read file: " + PathToUtf8(path));
+  const auto end = input.tellg();
+  if (end < 0 || static_cast<std::uint64_t>(end) > std::numeric_limits<std::size_t>::max())
+    throw ValidationError("GRIB file size exceeds platform limits");
+  const auto size = static_cast<std::size_t>(end);
+  std::size_t offset = 0, count = 0;
+  while (offset < size) {
+    CheckCancellation();
+    std::array<unsigned char, 16> header{};
+    input.seekg(static_cast<std::streamoff>(offset));
+    if (size-offset < 8 || !input.read(reinterpret_cast<char*>(header.data()), 8) ||
+        std::memcmp(header.data(), "GRIB", 4) != 0)
+      throw ValidationError("invalid GRIB header at byte offset " + std::to_string(offset));
+    const std::size_t header_size = header[7] == 2 ? 16 : 8;
+    if (header_size == 16 && (size-offset < 16 ||
+        !input.read(reinterpret_cast<char*>(header.data()+8), 8)))
+      throw ValidationError("truncated GRIB2 header at byte offset " + std::to_string(offset));
+    const auto length = MessageLengthAt(header, 0);
+    if (length < header_size+4 || length > size-offset)
+      throw ValidationError("invalid GRIB message length at byte offset " + std::to_string(offset));
+    std::array<char,4> terminator{};
+    input.seekg(static_cast<std::streamoff>(offset+length-4));
+    if (!input.read(terminator.data(),4) || std::memcmp(terminator.data(),"7777",4) != 0)
+      throw ValidationError("GRIB terminator not found at byte offset " + std::to_string(offset));
+    offset += length; ++count;
+  }
+  return {count,size};
+}
+
+GribScanResult ScanGribBytes(std::span<const unsigned char> data) {
+  std::size_t offset = 0;
+  std::size_t count = 0;
+  while (offset < data.size()) {
+    if (offset + 4 > data.size() ||
+        std::memcmp(data.data() + offset, "GRIB", 4) != 0) {
+      throw ValidationError("GRIB marker not found at byte offset " +
+                            std::to_string(offset));
+    }
+    const std::size_t length = MessageLengthAt(data, offset);
+    ValidateMessage(data, offset, length);
+    offset += length;
+    ++count;
+  }
+  return {count, data.size()};
+}
+
+GribNormalizeResult NormalizeGribStream(const std::filesystem::path& input,
+                                        const std::filesystem::path& output) {
+  const auto data = ReadBytes(input);
+  std::vector<unsigned char> clean;
+  std::size_t offset = 0, skipped = 0, count = 0;
+  while (offset < data.size()) {
+    static constexpr std::array<unsigned char, 4> kMarker{'G', 'R', 'I', 'B'};
+    auto marker =
+        std::search(data.begin() + static_cast<std::ptrdiff_t>(offset),
+                    data.end(), kMarker.begin(), kMarker.end());
+    if (marker == data.end()) {
+      skipped += data.size() - offset;
+      break;
+    }
+    const std::size_t position =
+        static_cast<std::size_t>(marker - data.begin());
+    skipped += position - offset;
+    const std::size_t length = MessageLengthAt(data, position);
+    ValidateMessage(data, position, length);
+    clean.insert(clean.end(), marker,
+                 marker + static_cast<std::ptrdiff_t>(length));
+    offset = position + length;
+    ++count;
+  }
+  if (count == 0)
+    throw ValidationError("no complete GRIB messages found in " +
+                          PathToUtf8(input));
+  std::filesystem::create_directories(
+      output.parent_path().empty() ? "." : output.parent_path());
+  std::ofstream stream(output, std::ios::binary | std::ios::trunc);
+  if (!stream || !stream.write(reinterpret_cast<const char*>(clean.data()),
+                               static_cast<std::streamsize>(clean.size()))) {
+    throw ValidationError("unable to write normalized GRIB: " +
+                          PathToUtf8(output));
+  }
+  stream.close();
+  ScanGribMessages(output);
+  return {count, data.size(), clean.size(), skipped};
+}
+
+GribWriteSummary RepackGrib2ToSimplePacking(
+    const std::filesystem::path& input,
+    const std::filesystem::path& output) {
+  if (input == output)
+    throw ValidationError("GRIB2 repack input and output must differ");
+  std::filesystem::create_directories(
+      output.parent_path().empty() ? "." : output.parent_path());
+  FILE* raw = OpenFileForReading(input);
+  if (!raw)
+    throw ValidationError("unable to open GRIB2 for repacking: " +
+                          PathToUtf8(input));
+  struct FileCloser {
+    void operator()(FILE* value) const { std::fclose(value); }
+  };
+  std::unique_ptr<FILE, FileCloser> file(raw);
+  std::ofstream stream(output, std::ios::binary | std::ios::trunc);
+  if (!stream)
+    throw ValidationError("unable to create repacked GRIB2: " +
+                          PathToUtf8(output));
+  std::size_t count = 0;
+  while (true) {
+    int error = 0;
+    HandlePtr handle(
+        codes_handle_new_from_file(nullptr, file.get(), PRODUCT_GRIB, &error),
+        &codes_handle_delete);
+    if (!handle) {
+      if (error == CODES_SUCCESS || std::feof(file.get())) break;
+      Check(error, "reading GRIB2 message for repacking");
+    }
+    if (GetLong(handle.get(), "editionNumber").value_or(0) != 2)
+      throw ValidationError("simple-packing normalisation requires GRIB2");
+    auto values = GetValues(handle.get());
+    if (!values)
+      throw ValidationError("ecCodes could not decode GRIB2 values");
+    const auto short_name = GetString(handle.get(), "shortName");
+    const auto level_type = GetString(handle.get(), "typeOfLevel");
+    const auto category = GetLong(handle.get(), "parameterCategory");
+    const auto number = GetLong(handle.get(), "parameterNumber");
+    if (short_name == "tcc") {
+      if (!(category == 6 && number == 1)) {
+        const auto [minimum, maximum] =
+            std::minmax_element(values->begin(), values->end());
+        if (minimum != values->end() && *minimum >= 0.0 && *maximum <= 1.0)
+          for (double& value : *values) value *= 100.0;
+        SetLong(handle.get(), "parameterCategory", 6);
+        SetLong(handle.get(), "parameterNumber", 1);
+      }
+      SetString(handle.get(), "typeOfLevel", "entireAtmosphere");
+    }
+    if (short_name == "tp" &&
+        !(category == 1 && (number == 8 || number == 52))) {
+      for (double& value : *values) value *= 1000.0;
+      SetLong(handle.get(), "parameterCategory", 1);
+      SetLong(handle.get(), "parameterNumber", 8);
+    }
+    if ((short_name == "cape" || short_name == "mucape" ||
+         (category == 7 && number == 6)) &&
+        level_type != "surface")
+      SetString(handle.get(), "typeOfLevel", "surface");
+    if ((short_name == "gust" || (category == 2 && number == 22)) &&
+        level_type != "surface")
+      SetString(handle.get(), "typeOfLevel", "surface");
+    if (short_name == "z" && level_type &&
+        level_type->find("isobaric") != std::string::npos) {
+      constexpr double kStandardGravity = 9.80665;
+      for (double& value : *values) value /= kStandardGravity;
+      SetString(handle.get(), "shortName", "gh");
+    }
+    SetString(handle.get(), "packingType", "grid_simple");
+    SetLong(handle.get(), "bitsPerValue", 24);
+    Check(codes_set_double_array(handle.get(), "values", values->data(),
+                                 values->size()),
+          "repacking GRIB2 values");
+    const void* message = nullptr;
+    std::size_t length = 0;
+    Check(codes_get_message(handle.get(), &message, &length),
+          "encoding repacked GRIB2 message");
+    stream.write(static_cast<const char*>(message),
+                 static_cast<std::streamsize>(length));
+    if (!stream) throw ValidationError("writing repacked GRIB2 message failed");
+    ++count;
+  }
+  stream.close();
+  const auto scan = ScanGribMessages(output);
+  if (count == 0 || scan.message_count != count)
+    throw ValidationError("repacked GRIB2 message count mismatch");
+  return {count, output};
+}
+
+Json::Value InspectGrib(const std::filesystem::path& path) {
+  const auto scan = ScanGribMessages(path);
+  const auto data = ReadBytes(path);
+  Json::Value result(Json::objectValue);
+  result["path"] = PathToUtf8(path);
+  result["message_count"] = Json::UInt64(scan.message_count);
+  result["byte_count"] = Json::UInt64(scan.byte_count);
+  result["stream_valid"] = true;
+  Json::Value editions(Json::objectValue);
+  for (std::size_t offset = 0; offset < data.size();) {
+    Increment(editions, std::to_string(data[offset + 7]));
+    offset += MessageLengthAt(data, offset);
+  }
+  result["edition_counts"] = editions;
+  result["eccodes_available"] = true;
+
+  Json::Value parameters(Json::objectValue), names(Json::objectValue),
+      short_names(Json::objectValue), grib2(Json::objectValue);
+  Json::Value currents(Json::objectValue);
+  currents["u_49"] = 0;
+  currents["v_50"] = 0;
+  currents["u_grib2"] = 0;
+  currents["v_grib2"] = 0;
+  Json::Value messages(Json::arrayValue);
+  std::set<std::string> valid_times;
+  bool have_coverage = false;
+  Json::Value coverage(Json::objectValue);
+  Json::Value coverage_regions(Json::arrayValue);
+  double coverage_west = 0.0, coverage_south = 0.0, coverage_east = 0.0,
+         coverage_north = 0.0;
+  FILE* raw = OpenFileForReading(path);
+  if (!raw)
+    throw ValidationError("unable to open GRIB with ecCodes: " + PathToUtf8(path));
+  struct FileCloser {
+    void operator()(FILE* value) const { std::fclose(value); }
+  };
+  std::unique_ptr<FILE, FileCloser> file(raw);
+  while (true) {
+    int error = 0;
+    HandlePtr handle(
+        codes_handle_new_from_file(nullptr, file.get(), PRODUCT_GRIB, &error),
+        &codes_handle_delete);
+    if (!handle) {
+      if (error == CODES_SUCCESS || std::feof(file.get())) break;
+      Check(error, "reading GRIB message");
+      break;
+    }
+    Json::Value message(Json::objectValue);
+    message["index"] = Json::UInt64(messages.size());
+    if (const auto edition = GetLong(handle.get(), "editionNumber"))
+      message["edition"] = Json::Int64(*edition);
+    auto parameter = GetLong(handle.get(), "indicatorOfParameter");
+    if (!parameter) parameter = GetLong(handle.get(), "parameterNumber");
+    if (parameter) {
+      const std::string key = std::to_string(*parameter);
+      Increment(parameters, key);
+      if (auto name = GetString(handle.get(), "parameterName"))
+        names[key] = *name;
+      else if (auto name = GetString(handle.get(), "shortName"))
+        names[key] = *name;
+      if (*parameter == 49) currents["u_49"] = currents["u_49"].asUInt64() + 1;
+      if (*parameter == 50) currents["v_50"] = currents["v_50"].asUInt64() + 1;
+      message["parameter_number"] = Json::Int64(*parameter);
+    }
+    if (auto short_name = GetString(handle.get(), "shortName")) {
+      Increment(short_names, *short_name);
+      message["short_name"] = *short_name;
+    }
+    if (auto parameter_name = GetString(handle.get(), "parameterName"))
+      message["parameter_name"] = *parameter_name;
+    auto discipline = GetLong(handle.get(), "discipline");
+    auto category = GetLong(handle.get(), "parameterCategory");
+    auto number = GetLong(handle.get(), "parameterNumber");
+    if (discipline && category && number) {
+      const std::string key = std::to_string(*discipline) + ":" +
+                              std::to_string(*category) + ":" +
+                              std::to_string(*number);
+      Increment(grib2, key);
+      message["discipline"] = Json::Int64(*discipline);
+      message["parameter_category"] = Json::Int64(*category);
+      message["parameter_number"] = Json::Int64(*number);
+      if (*discipline == 10 && *category == 1 && *number == 2)
+        currents["u_grib2"] = currents["u_grib2"].asUInt64() + 1;
+      if (*discipline == 10 && *category == 1 && *number == 3)
+        currents["v_grib2"] = currents["v_grib2"].asUInt64() + 1;
+    }
+    if (const auto validity = ValidityString(handle.get())) {
+      valid_times.insert(*validity);
+      message["valid_time"] = *validity;
+    }
+    if (const auto level_type = GetString(handle.get(), "typeOfLevel"))
+      message["level_type"] = *level_type;
+    if (const auto level = GetLong(handle.get(), "level"))
+      message["level"] = Json::Int64(*level);
+    if (const auto product_template =
+            GetLong(handle.get(), "productDefinitionTemplateNumber"))
+      message["product_definition_template"] =
+          Json::Int64(*product_template);
+    if (const auto step_type = GetString(handle.get(), "stepType"))
+      message["step_type"] = *step_type;
+    if (const auto start_step = GetLong(handle.get(), "startStep"))
+      message["start_step"] = Json::Int64(*start_step);
+    if (const auto end_step = GetLong(handle.get(), "endStep"))
+      message["end_step"] = Json::Int64(*end_step);
+    if (message.get("edition", 0).asInt64() == 1) {
+      if (const auto unit = GetLong(handle.get(), "indicatorOfUnitOfTimeRange"))
+        message["time_unit"] = Json::Int64(*unit);
+      if (const auto range = GetLong(handle.get(), "timeRangeIndicator"))
+        message["time_range_indicator"] = Json::Int64(*range);
+      if (const auto p1 = GetLong(handle.get(), "P1"))
+        message["p1"] = Json::Int64(*p1);
+      if (const auto p2 = GetLong(handle.get(), "P2"))
+        message["p2"] = Json::Int64(*p2);
+    }
+    if (const auto packing = GetString(handle.get(), "packingType"))
+      message["packing_type"] = *packing;
+
+    auto first_lon =
+        GetDouble(handle.get(), "longitudeOfFirstGridPointInDegrees");
+    auto first_lat =
+        GetDouble(handle.get(), "latitudeOfFirstGridPointInDegrees");
+    auto last_lon =
+        GetDouble(handle.get(), "longitudeOfLastGridPointInDegrees");
+    auto last_lat = GetDouble(handle.get(), "latitudeOfLastGridPointInDegrees");
+    if (first_lon && first_lat && last_lon && last_lat) {
+      const auto [west, east] =
+          LongitudeExtent(handle.get(), *first_lon, *last_lon);
+      const double south = std::min(*first_lat, *last_lat);
+      const double north = std::max(*first_lat, *last_lat);
+      Json::Value grid(Json::objectValue);
+      grid["west"] = west;
+      grid["south"] = south;
+      grid["east"] = east;
+      grid["north"] = north;
+      // Keep individual rectangles: a single envelope loses the seam and can
+      // invent overlap in gaps between regional/forecast-extension grids.
+      if (std::find(coverage_regions.begin(), coverage_regions.end(), grid) ==
+          coverage_regions.end())
+        coverage_regions.append(grid);
+      if (const auto ni = GetLong(handle.get(), "Ni"))
+        grid["ni"] = Json::Int64(*ni);
+      if (const auto nj = GetLong(handle.get(), "Nj"))
+        grid["nj"] = Json::Int64(*nj);
+      if (const auto increment =
+              GetDouble(handle.get(), "iDirectionIncrementInDegrees"))
+        grid["longitude_increment"] = *increment;
+      if (const auto increment =
+              GetDouble(handle.get(), "jDirectionIncrementInDegrees"))
+        grid["latitude_increment"] = *increment;
+      message["grid"] = grid;
+      // The legacy summary remains an ordinary [-180, 180] envelope. Exact
+      // overlap uses regions, whose east may exceed 180 for a wrapped grid.
+      const double envelope_west = east > 180.0 ? -180.0 : west;
+      const double envelope_east = east > 180.0 ? 180.0 : east;
+      if (!have_coverage) {
+        coverage_west = envelope_west;
+        coverage_south = south;
+        coverage_east = envelope_east;
+        coverage_north = north;
+        have_coverage = true;
+      } else {
+        coverage_west = std::min(coverage_west, envelope_west);
+        coverage_south = std::min(coverage_south, south);
+        coverage_east = std::max(coverage_east, envelope_east);
+        coverage_north = std::max(coverage_north, north);
+      }
+    }
+
+    if (const auto values = GetValues(handle.get())) {
+      Json::Value statistics(Json::objectValue);
+      statistics["count"] = Json::UInt64(values->size());
+      const auto missing_value = GetDouble(handle.get(), "missingValue");
+      std::size_t missing_count = 0;
+      double sum = 0.0;
+      double minimum = std::numeric_limits<double>::infinity();
+      double maximum = -std::numeric_limits<double>::infinity();
+      Json::Value sample(Json::arrayValue);
+      for (const double value : *values) {
+        const bool missing =
+            !std::isfinite(value) || (missing_value && value == *missing_value);
+        if (missing) {
+          ++missing_count;
+          continue;
+        }
+        minimum = std::min(minimum, value);
+        maximum = std::max(maximum, value);
+        sum += value;
+        if (sample.size() < 8) sample.append(value);
+      }
+      statistics["missing_count"] = Json::UInt64(missing_count);
+      const std::size_t present = values->size() - missing_count;
+      if (present) {
+        statistics["minimum"] = minimum;
+        statistics["maximum"] = maximum;
+        statistics["mean"] = sum / static_cast<double>(present);
+      }
+      statistics["sample"] = sample;
+      message["values"] = statistics;
+    }
+    messages.append(message);
+  }
+  result["parameter_counts"] = parameters;
+  result["parameter_names"] = names;
+  result["short_name_counts"] = short_names;
+  result["grib2_parameter_counts"] = grib2;
+  result["current_component_counts"] = currents;
+  result["messages"] = messages;
+  if (!valid_times.empty()) {
+    result["first_valid_time"] = *valid_times.begin();
+    result["last_valid_time"] = *valid_times.rbegin();
+    Json::Value times(Json::arrayValue);
+    for (const auto& value : valid_times) times.append(value);
+    result["valid_times"] = times;
+  }
+  if (have_coverage) {
+    coverage["west"] = coverage_west;
+    coverage["south"] = coverage_south;
+    coverage["east"] = coverage_east;
+    coverage["north"] = coverage_north;
+    coverage["regions"] = coverage_regions;
+    result["coverage"] = coverage;
+  }
+  return result;
+}
+
+
+GribWriteSummary CropAndStitchGrib(
+    const std::vector<std::filesystem::path>& inputs, const BoundingBox& bbox,
+    const std::filesystem::path& output, bool east_inclusive) {
+  bbox.Validate();
+  if (inputs.empty()) throw ValidationError("no GRIB inputs to crop");
+  struct FileCloser { void operator()(FILE* file) const { if (file) std::fclose(file); } };
+  struct Fragment { std::filesystem::path path; std::int64_t offset{}; };
+  std::vector<std::vector<Fragment>> groups;
+  std::map<std::string, std::size_t> identities;
+  // Index packed records on disk; decode only one field/time at a time.
+  for (const auto& path : inputs) {
+    if (path == output) throw ValidationError("GRIB crop requires a distinct output path");
+    ScanGribMessages(path);
+    std::unique_ptr<FILE, FileCloser> file(OpenFileForReading(path));
+    if (!file) throw ValidationError("cannot open GRIB crop input");
+    for (;;) {
+      const auto offset = FileTell(file.get());
+      int error = 0;
+      HandlePtr handle(codes_handle_new_from_file(nullptr, file.get(), PRODUCT_GRIB, &error), &codes_handle_delete);
+      if (!handle) { Check(error, "indexing GRIB crop"); break; }
+      if (GetString(handle.get(), "gridType") != "regular_ll")
+        throw ValidationError("crossing GRIB crop requires a regular latitude/longitude grid");
+      std::ostringstream identity;
+      for (const char* key : {"edition", "centre", "subCentre", "tablesVersion", "localTablesVersion",
+           "table2Version", "discipline", "parameterCategory", "parameterNumber", "indicatorOfParameter",
+           "typeOfLevel", "level", "typeOfSecondFixedSurface", "scaledValueOfSecondFixedSurface",
+           "dataDate", "dataTime", "second", "stepUnits", "startStep", "endStep", "stepType",
+           "productDefinitionTemplateNumber", "typeOfEnsembleForecast", "perturbationNumber",
+           "typeOfStatisticalProcessing", "numberOfTimeRanges", "generatingProcessIdentifier",
+           "typeOfGeneratingProcess", "typeOfFirstFixedSurface", "scaleFactorOfFirstFixedSurface",
+           "scaledValueOfFirstFixedSurface", "scaleFactorOfSecondFixedSurface",
+           "probabilityType", "scaleFactorOfLowerLimit", "scaledValueOfLowerLimit",
+           "scaleFactorOfUpperLimit", "scaledValueOfUpperLimit"})
+        identity << key << '=' << GetString(handle.get(), key).value_or("-") << '|';
+      auto [found, inserted] = identities.emplace(identity.str(), groups.size());
+      if (inserted) groups.emplace_back();
+      groups[found->second].push_back({path, offset});
+    }
+  }
+  if (groups.empty()) throw ValidationError("GRIB crop has no records");
+  std::filesystem::create_directories(output.parent_path().empty() ? "." : output.parent_path());
+  const auto temporary = TemporarySibling(output);
+  try {
+    std::ofstream destination(temporary, std::ios::binary | std::ios::trunc);
+    if (!destination) throw ValidationError("cannot create GRIB crop output");
+    for (const auto& group : groups) {
+      CheckCancellation();
+      struct Piece { std::vector<double> x, y, values; std::vector<bool> missing; };
+      std::vector<Piece> pieces;
+      HandlePtr prototype(nullptr, &codes_handle_delete);
+      double dx = 0.0, dy = 0.0, precision = 1e-8;
+      for (const auto& fragment : group) {
+        std::unique_ptr<FILE, FileCloser> file(OpenFileForReading(fragment.path));
+        if (!file || FileSeek(file.get(), fragment.offset))
+          throw ValidationError("cannot read indexed GRIB crop fragment");
+        int error = 0;
+        HandlePtr handle(codes_handle_new_from_file(nullptr, file.get(), PRODUCT_GRIB, &error), &codes_handle_delete);
+        Check(error, "reading GRIB crop fragment");
+        if (!handle) throw ValidationError("missing indexed GRIB crop fragment");
+        const long ni = GetLong(handle.get(), "Ni").value_or(0);
+        const long nj = GetLong(handle.get(), "Nj").value_or(0);
+        const double ix = GetDouble(handle.get(), "iDirectionIncrementInDegrees").value_or(0.0);
+        const double jy = GetDouble(handle.get(), "jDirectionIncrementInDegrees").value_or(0.0);
+        if (ni < 2 || nj < 2 || ni > 5000000 / nj || ix <= 0.0 || jy <= 0.0)
+          throw ValidationError("invalid regular GRIB crop dimensions/increments");
+        if (!prototype) {
+          prototype.reset(codes_handle_clone(handle.get())); dx = ix; dy = jy;
+        } else if (std::abs(dx-ix) > 1e-6 || std::abs(dy-jy) > 1e-6 ||
+                   GetString(prototype.get(), "shapeOfTheEarth") != GetString(handle.get(), "shapeOfTheEarth"))
+          throw ValidationError("GRIB fragments have incompatible grid geometry");
+        const long binary = GetLong(handle.get(), "binaryScaleFactor").value_or(-30);
+        const long decimal = GetLong(handle.get(), "decimalScaleFactor").value_or(0);
+        if (GetLong(handle.get(), "bitsPerValue").value_or(0) > 0)
+          precision = std::max(precision, 2.0*std::pow(2.0, binary)*std::pow(10.0, -decimal));
+        const double lon0 = GetDouble(handle.get(), "longitudeOfFirstGridPointInDegrees").value_or(0);
+        const double lat0 = GetDouble(handle.get(), "latitudeOfFirstGridPointInDegrees").value_or(0);
+        const double di = GetLong(handle.get(), "iScansNegatively").value_or(0) ? -ix : ix;
+        const double dj = GetLong(handle.get(), "jScansPositively").value_or(0) ? jy : -jy;
+        const bool adjacent_j = GetLong(handle.get(), "jPointsAreConsecutive").value_or(0);
+        const bool alternating = GetLong(handle.get(), "alternativeRowScanning").value_or(0);
+        std::vector<std::pair<double, long>> columns, rows;
+        constexpr double tolerance = 1e-6;
+        for (long i = 0; i < ni; ++i) {
+          const double longitude = UnwrapLongitude(lon0+i*di, bbox.west-tolerance);
+          if (longitude >= bbox.west-tolerance &&
+              (east_inclusive ? longitude <= bbox.UnwrappedEast()+tolerance : longitude < bbox.UnwrappedEast()-tolerance))
+            columns.emplace_back(longitude, i);
+        }
+        for (long j = 0; j < nj; ++j) {
+          const double latitude = lat0+j*dj;
+          if (latitude >= bbox.south-tolerance && latitude <= bbox.north+tolerance)
+            rows.emplace_back(latitude, j);
+        }
+        std::stable_sort(columns.begin(), columns.end());
+        std::stable_sort(rows.begin(), rows.end());
+        // Retain duplicate seam columns until assembly so inconsistent values
+        // or masks cannot be silently discarded.
+        if (columns.empty() || rows.empty()) continue;
+        auto decoded = GetValues(handle.get());
+        if (!decoded || decoded->size() != static_cast<std::size_t>(ni*nj))
+          throw ValidationError("GRIB crop values do not match the grid");
+        const double missing = GetDouble(handle.get(), "missingValue").value_or(9999.0);
+        const bool bitmap = GetLong(handle.get(), "bitmapPresent").value_or(0);
+        Piece piece;
+        for (const auto& [longitude, i] : columns) { (void)i; piece.x.push_back(longitude); }
+        for (const auto& [latitude, j] : rows) { (void)j; piece.y.push_back(latitude); }
+        for (const auto& [latitude, j] : rows) for (const auto& [longitude, i] : columns) {
+          (void)latitude; (void)longitude;
+          long index;
+          if (adjacent_j) {
+            const long row = alternating && i%2 ? nj-1-j : j;
+            index = i*nj+row;
+          } else {
+            const long column = alternating && j%2 ? ni-1-i : i;
+            index = j*ni+column;
+          }
+          const double value = (*decoded)[index];
+          piece.values.push_back(value);
+          piece.missing.push_back(!std::isfinite(value) || (bitmap && value == missing));
+        }
+        pieces.push_back(std::move(piece));
+      }
+      if (pieces.empty()) throw ValidationError("GRIB field has no data in the requested area");
+      const auto& latitudes = pieces.front().y;
+      std::vector<double> longitudes;
+      for (const auto& piece : pieces) {
+        if (piece.y.size() != latitudes.size())
+          throw ValidationError("GRIB fragments have different latitude coverage");
+        for (std::size_t y=0; y<latitudes.size(); ++y)
+          if (std::abs(piece.y[y]-latitudes[y]) > 1e-6)
+            throw ValidationError("GRIB fragments have misaligned latitudes");
+        longitudes.insert(longitudes.end(), piece.x.begin(), piece.x.end());
+      }
+      std::sort(longitudes.begin(), longitudes.end());
+      longitudes.erase(std::unique(longitudes.begin(), longitudes.end(), [](double a, double b) {
+        return std::abs(a-b) < 1e-6;
+      }), longitudes.end());
+      if (longitudes.size()<2 || latitudes.size()<2 ||
+          longitudes.front()-bbox.west >= dx+1e-6 ||
+          bbox.UnwrappedEast()-longitudes.back() > dx+1e-6 ||
+          latitudes.front()-bbox.south >= dy+1e-6 || bbox.north-latitudes.back() >= dy+1e-6)
+        throw ValidationError("GRIB field does not cover the requested area on its native grid");
+      for (std::size_t i=1; i<longitudes.size(); ++i)
+        if (std::abs(longitudes[i]-longitudes[i-1]-dx) > 1e-6)
+          throw ValidationError("GRIB field has a longitude gap or misaligned fragments");
+      const std::size_t nx = longitudes.size(), ny = latitudes.size();
+      if (nx > 5000000/ny) throw ValidationError("stitched GRIB grid is too large");
+      const double missing = GetDouble(prototype.get(), "missingValue").value_or(9999.0);
+      std::vector<double> values(nx*ny, missing);
+      std::vector<bool> seen(nx*ny, false), masks(nx*ny, true);
+      for (const auto& piece : pieces) for (std::size_t x=0; x<piece.x.size(); ++x) {
+        const auto column = std::lower_bound(longitudes.begin(), longitudes.end(), piece.x[x]-1e-6);
+        const auto target_x = static_cast<std::size_t>(column-longitudes.begin());
+        for (std::size_t y=0; y<ny; ++y) {
+          const auto source = y*piece.x.size()+x, target = y*nx+target_x;
+          if (seen[target] && (masks[target] != piece.missing[source] ||
+              (!masks[target] && std::abs(values[target]-piece.values[source]) > precision)))
+            throw ValidationError("overlapping GRIB fragments contain conflicting values/masks");
+          seen[target]=true; masks[target]=piece.missing[source];
+          values[target]=masks[target] ? missing : piece.values[source];
+        }
+      }
+      if (std::find(seen.begin(), seen.end(), false) != seen.end())
+        throw ValidationError("stitched GRIB field has uncovered cells");
+      if (GetLong(prototype.get(), "edition") == 2)
+        SetString(prototype.get(), "packingType", "grid_simple");
+      SetLong(prototype.get(), "Ni", static_cast<long>(nx));
+      SetLong(prototype.get(), "Nj", static_cast<long>(ny));
+      SetDouble(prototype.get(), "longitudeOfFirstGridPointInDegrees", Longitude360(longitudes.front()));
+      SetDouble(prototype.get(), "longitudeOfLastGridPointInDegrees", Longitude360(longitudes.back()));
+      SetDouble(prototype.get(), "latitudeOfFirstGridPointInDegrees", latitudes.front());
+      SetDouble(prototype.get(), "latitudeOfLastGridPointInDegrees", latitudes.back());
+      SetLong(prototype.get(), "iScansNegatively", 0);
+      SetLong(prototype.get(), "jScansPositively", 1);
+      SetLong(prototype.get(), "jPointsAreConsecutive", 0);
+      if (GetLong(prototype.get(), "edition") == 2)
+        SetLong(prototype.get(), "alternativeRowScanning", 0);
+      SetLong(prototype.get(), "bitmapPresent", std::find(masks.begin(), masks.end(), true) != masks.end());
+      SetDouble(prototype.get(), "missingValue", missing);
+      const long bits = GetLong(prototype.get(), "bitsPerValue").value_or(16);
+      SetLong(prototype.get(), "bitsPerValue", std::min(32L, std::max(16L, bits+2)));
+      Check(codes_set_double_array(prototype.get(), "values", values.data(), values.size()), "encoding cropped GRIB values");
+      const void* message = nullptr; std::size_t length = 0;
+      Check(codes_get_message(prototype.get(), &message, &length), "encoding cropped GRIB message");
+      destination.write(static_cast<const char*>(message), static_cast<std::streamsize>(length));
+      if (!destination) throw ValidationError("writing cropped GRIB failed");
+    }
+    destination.close();
+    if (ScanGribMessages(temporary).message_count != groups.size())
+      throw ValidationError("cropped GRIB message count mismatch");
+    std::filesystem::rename(temporary, output);
+    return {groups.size(), output};
+  } catch (...) {
+    std::error_code ignored; std::filesystem::remove(temporary, ignored); throw;
+  }
+}
+
+GribWriteSummary WriteGrib1Currents(const std::vector<CurrentGrid>& grids,
+                                    const std::filesystem::path& output) {
+  if (grids.empty())
+    throw ValidationError("no current grids were provided for GRIB writing");
+  for (const auto& grid : grids) grid.Validate();
+  // GRIB1 reference times have minute precision. Current generators produce
+  // whole-hour offsets from the requested start, so retaining the start minute
+  // avoids silently shifting a request such as 12:37 to 12:00.
+  const TimePoint reference =
+      std::chrono::floor<std::chrono::minutes>(grids.front().time);
+  if (grids.front().time != reference)
+    throw ValidationError(
+        "GRIB1 current reference time must have whole-minute precision");
+  struct EncodedLead {
+    long p1{};
+    long p2{};
+    long time_range_indicator{};
+  };
+  std::vector<EncodedLead> leads;
+  leads.reserve(grids.size());
+  for (const auto& current : grids) {
+    const auto offset = current.time - reference;
+    const auto forecast_hours =
+        std::chrono::duration_cast<std::chrono::hours>(offset);
+    if (offset != forecast_hours)
+      throw ValidationError(
+          "GRIB1 current valid times must use whole-hour offsets");
+    if (forecast_hours.count() < 0)
+      throw ValidationError(
+          "current grids must not be earlier than the GRIB reference time");
+    if (forecast_hours.count() <= 255) {
+      leads.push_back({static_cast<long>(forecast_hours.count()), 0, 0});
+    } else if (forecast_hours.count() <= 65535) {
+      // GRIB1 time range indicator 10 defines octets 19 and 20 as one
+      // unsigned 16-bit P1 forecast lead. xGRIB's GRIB1 reader supports this
+      // standard representation.
+      leads.push_back({static_cast<long>((forecast_hours.count() >> 8) & 0xff),
+                       static_cast<long>(forecast_hours.count() & 0xff), 10});
+    } else {
+      throw ValidationError("GRIB1 current forecast lead exceeds 65535 hours");
+    }
+  }
+  std::filesystem::create_directories(
+      output.parent_path().empty() ? "." : output.parent_path());
+  std::ofstream stream(output, std::ios::binary | std::ios::trunc);
+  if (!stream)
+    throw ValidationError("unable to create GRIB output: " +
+                          PathToUtf8(output));
+  std::size_t count = 0;
+  for (std::size_t grid_index = 0; grid_index < grids.size(); ++grid_index) {
+    const auto& current = grids[grid_index];
+    const auto& lead = leads[grid_index];
+    const auto epoch = reference.time_since_epoch().count();
+    std::time_t raw_time = static_cast<std::time_t>(epoch);
+    const std::tm tm = UtcTime(raw_time);
+    for (const auto& [parameter, source_values] :
+         std::array<std::pair<long, const std::vector<double>*>, 2>{
+             {{49, &current.u_mps}, {50, &current.v_mps}}}) {
+      HandlePtr handle(
+          codes_handle_new_from_samples(nullptr, "regular_ll_sfc_grib1"),
+          &codes_handle_delete);
+      if (!handle)
+        throw ValidationError(
+            "ecCodes could not create regular_ll_sfc_grib1 sample");
+      SetLong(handle.get(), "editionNumber", 1);
+      SetLong(handle.get(), "table2Version", 2);
+      SetLong(handle.get(), "indicatorOfParameter", parameter);
+      SetLong(handle.get(), "indicatorOfTypeOfLevel", 1);
+      SetLong(handle.get(), "level", 0);
+      SetLong(handle.get(), "dataDate",
+              (tm.tm_year + 1900) * 10000 + (tm.tm_mon + 1) * 100 + tm.tm_mday);
+      SetLong(handle.get(), "dataTime", tm.tm_hour * 100 + tm.tm_min);
+      SetLong(handle.get(), "indicatorOfUnitOfTimeRange", 1);
+      // Set the interpretation before its octets. Older ecCodes releases can
+      // otherwise apply the previous template's key constraints.
+      SetLong(handle.get(), "timeRangeIndicator", lead.time_range_indicator);
+      SetLong(handle.get(), "P1", lead.p1);
+      SetLong(handle.get(), "P2", lead.p2);
+      SetLong(handle.get(), "Ni", static_cast<long>(current.grid.nx()));
+      SetLong(handle.get(), "Nj", static_cast<long>(current.grid.ny()));
+      SetDouble(handle.get(), "latitudeOfFirstGridPointInDegrees",
+                current.grid.latitudes.front());
+      SetDouble(handle.get(), "longitudeOfFirstGridPointInDegrees",
+                Longitude360(current.grid.longitudes.front()));
+      SetDouble(handle.get(), "latitudeOfLastGridPointInDegrees",
+                current.grid.latitudes.back());
+      SetDouble(handle.get(), "longitudeOfLastGridPointInDegrees",
+                Longitude360(current.grid.longitudes.back()));
+      SetDouble(handle.get(), "iDirectionIncrementInDegrees",
+                current.grid.longitude_spacing_deg);
+      SetDouble(handle.get(), "jDirectionIncrementInDegrees",
+                current.grid.latitude_spacing_deg);
+      SetLong(handle.get(), "iScansNegatively", 0);
+      SetLong(handle.get(), "jScansPositively", 1);
+      SetLong(handle.get(), "jPointsAreConsecutive", 0);
+      SetLong(handle.get(), "bitsPerValue", 16);
+      std::vector<double> values = *source_values;
+      bool missing = false;
+      for (std::size_t i = 0; i < values.size(); ++i) {
+        if ((current.has_mask() && current.mask[i]) ||
+            !std::isfinite(values[i])) {
+          values[i] = 9999.0;
+          missing = true;
+        }
+      }
+      if (missing) {
+        SetLong(handle.get(), "bitmapPresent", 1);
+        SetDouble(handle.get(), "missingValue", 9999.0);
+      }
+      std::size_t size = values.size();
+      Check(codes_set_double_array(handle.get(), "values", values.data(), size),
+            "setting values");
+      const void* message = nullptr;
+      std::size_t length = 0;
+      Check(codes_get_message(handle.get(), &message, &length),
+            "encoding GRIB message");
+      stream.write(static_cast<const char*>(message),
+                   static_cast<std::streamsize>(length));
+      if (!stream) throw ValidationError("writing GRIB message failed");
+      ++count;
+    }
+  }
+  stream.close();
+  const auto scan = ScanGribMessages(output);
+  if (scan.message_count != count)
+    throw ValidationError("written GRIB message count mismatch");
+  return {count, output};
+}
+
+GribWriteSummary WriteRegularLatLonGrib2Chunk(
+    const RegularGrid& grid, TimePoint reference,
+    const std::vector<Grib2Field>& fields, const std::filesystem::path& output,
+    bool append) {
+  if (fields.empty()) throw ValidationError("no GRIB2 fields were provided");
+  if (grid.nx() < 2 || grid.ny() < 2)
+    throw ValidationError("GRIB2 output requires at least a 2 x 2 grid");
+  const std::time_t raw_time =
+      static_cast<std::time_t>(reference.time_since_epoch().count());
+  const std::tm tm = UtcTime(raw_time);
+  std::filesystem::create_directories(
+      output.parent_path().empty() ? "." : output.parent_path());
+  const auto mode =
+      std::ios::binary | (append ? std::ios::app : std::ios::trunc);
+  std::ofstream stream(output, mode);
+  if (!stream)
+    throw ValidationError("unable to create GRIB2 output: " + PathToUtf8(output));
+  std::size_t count = 0;
+  for (const auto& field : fields) {
+    if (field.values.size() != grid.size())
+      throw ValidationError("GRIB2 field " + field.short_name +
+                            " does not match grid shape");
+    if (!field.mask.empty() && field.mask.size() != grid.size())
+      throw ValidationError("GRIB2 field mask does not match grid shape");
+    if (field.forecast_hour < 0)
+      throw ValidationError("GRIB2 forecast hour must not be negative");
+    HandlePtr handle(
+        codes_handle_new_from_samples(nullptr, "regular_ll_sfc_grib2"),
+        &codes_handle_delete);
+    if (!handle)
+      throw ValidationError(
+          "ecCodes could not create regular_ll_sfc_grib2 sample");
+    SetLong(handle.get(), "editionNumber", 2);
+    SetLong(handle.get(), "discipline", 0);
+    SetLong(handle.get(), "productDefinitionTemplateNumber",
+            field.step_type ? 8 : 0);
+    SetLong(handle.get(), "typeOfGeneratingProcess", 2);
+    SetLong(handle.get(), "generatingProcessIdentifier", 255);
+    if (field.short_name != "refc") {
+      SetString(handle.get(), "shortName", field.short_name);
+    }
+    const bool surface_wave = field.short_name == "swh" ||
+                              field.short_name == "htsgw" ||
+                              field.short_name == "perpw" ||
+                              field.short_name == "dirpw" ||
+                              field.short_name == "mwp" ||
+                              field.short_name == "mwd";
+    if (field.type_of_level)
+      SetString(handle.get(), "typeOfLevel", *field.type_of_level);
+    else if (surface_wave)
+      // Older ecCodes samples retain heightAboveGround even after selecting
+      // an ocean-wave parameter. Encode its surface level explicitly so
+      // readers do not discard an otherwise valid wave field.
+      SetString(handle.get(), "typeOfLevel", "surface");
+    if (field.level)
+      SetDouble(handle.get(), "level", *field.level);
+    else if (surface_wave)
+      SetDouble(handle.get(), "level", 0);
+    SetLong(handle.get(), "dataDate",
+            (tm.tm_year + 1900) * 10000 + (tm.tm_mon + 1) * 100 + tm.tm_mday);
+    SetLong(handle.get(), "dataTime", tm.tm_hour * 100 + tm.tm_min);
+    SetLong(handle.get(), "stepUnits", 1);
+    SetLong(handle.get(), "forecastTime", field.forecast_hour);
+    if (field.step_type) {
+      if (field.interval_hours <= 0 ||
+          field.interval_hours > field.forecast_hour)
+        throw ValidationError("GRIB2 interval field " + field.short_name +
+                              " has an invalid interval");
+      SetString(handle.get(), "stepType", *field.step_type);
+      SetLong(handle.get(), "startStep",
+              field.forecast_hour - field.interval_hours);
+      SetLong(handle.get(), "endStep", field.forecast_hour);
+    } else if (field.interval_hours != 0) {
+      throw ValidationError("GRIB2 interval requires a step type");
+    }
+    SetLong(handle.get(), "Ni", static_cast<long>(grid.nx()));
+    SetLong(handle.get(), "Nj", static_cast<long>(grid.ny()));
+    SetDouble(handle.get(), "latitudeOfFirstGridPointInDegrees",
+              grid.latitudes.front());
+    SetDouble(handle.get(), "longitudeOfFirstGridPointInDegrees",
+              Longitude360(grid.longitudes.front()));
+    SetDouble(handle.get(), "latitudeOfLastGridPointInDegrees",
+              grid.latitudes.back());
+    SetDouble(handle.get(), "longitudeOfLastGridPointInDegrees",
+              Longitude360(grid.longitudes.back()));
+    SetDouble(handle.get(), "iDirectionIncrementInDegrees",
+              grid.longitude_spacing_deg);
+    SetDouble(handle.get(), "jDirectionIncrementInDegrees",
+              grid.latitude_spacing_deg);
+    SetLong(handle.get(), "iScansNegatively", 0);
+    SetLong(handle.get(), "jScansPositively", 1);
+    SetLong(handle.get(), "jPointsAreConsecutive", 0);
+    SetLong(handle.get(), "bitsPerValue", 24);
+    // Apply identities after level, interval and template keys.  Older
+    // ecCodes releases may recalculate the parameter when one of those keys
+    // changes, otherwise turning portable WMO fields into "unknown".
+    if (field.short_name == "refc") {
+      // Composite reflectivity 0/16/196 is understood by xGRIB but is absent
+      // from some ecCodes centre tables used by the generic sample.
+      SetLong(handle.get(), "discipline", 0);
+      SetLong(handle.get(), "parameterCategory", 16);
+      SetLong(handle.get(), "parameterNumber", 196);
+    } else if (field.short_name == "tp") {
+      // The generic sample maps "tp" to a centre-local parameter definition.
+      SetLong(handle.get(), "discipline", 0);
+      SetLong(handle.get(), "parameterCategory", 1);
+      SetLong(handle.get(), "parameterNumber", 8);
+    } else if (field.short_name == "tcc") {
+      // xGRIB consumes WMO total cloud cover 0/6/1.
+      SetLong(handle.get(), "discipline", 0);
+      SetLong(handle.get(), "parameterCategory", 6);
+      SetLong(handle.get(), "parameterNumber", 1);
+    }
+    std::vector<double> values = field.values;
+    bool missing = false;
+    for (std::size_t i = 0; i < values.size(); ++i) {
+      if ((!field.mask.empty() && field.mask[i]) || !std::isfinite(values[i])) {
+        values[i] = 9999.0;
+        missing = true;
+      }
+    }
+    if (missing) {
+      SetLong(handle.get(), "bitmapPresent", 1);
+      SetDouble(handle.get(), "missingValue", 9999.0);
+    }
+    Check(codes_set_double_array(handle.get(), "values", values.data(),
+                                 values.size()),
+          "setting GRIB2 values");
+    const void* message = nullptr;
+    std::size_t length = 0;
+    Check(codes_get_message(handle.get(), &message, &length),
+          "encoding GRIB2 message");
+    stream.write(static_cast<const char*>(message),
+                 static_cast<std::streamsize>(length));
+    if (!stream) throw ValidationError("writing GRIB2 message failed");
+    ++count;
+  }
+  stream.close();
+  return {count, output};
+}
+
+GribWriteSummary WriteRegularLatLonGrib2(const RegularGrid& grid,
+                                         TimePoint reference,
+                                         const std::vector<Grib2Field>& fields,
+                                         const std::filesystem::path& output) {
+  const auto written =
+      WriteRegularLatLonGrib2Chunk(grid, reference, fields, output, false);
+  const auto scan = ScanGribMessages(output);
+  if (scan.message_count != written.message_count)
+    throw ValidationError("written GRIB2 message count mismatch");
+  return written;
+}
+
+MergeStreamsResult MergeGribStreams(
+    const std::vector<std::pair<std::string, std::filesystem::path>>& inputs,
+    const std::filesystem::path& output, bool overwrite) {
+  if (inputs.empty())
+    throw ValidationError("at least one GRIB input is required");
+  if (std::filesystem::exists(output) && std::filesystem::is_directory(output))
+    throw ValidationError("output must be a file path, not a directory");
+  if (std::filesystem::exists(output) && !overwrite)
+    throw ValidationError("output already exists: " + PathToUtf8(output) +
+                          "; use --overwrite to replace it");
+  std::map<std::string, std::size_t> counts;
+  std::size_t expected = 0;
+  for (const auto& [label, path] : inputs) {
+    if (!std::filesystem::exists(path))
+      throw ValidationError(label + " GRIB not found: " + PathToUtf8(path));
+    const auto scan = ScanGribMessages(path);
+    counts[label] = scan.message_count;
+    expected += scan.message_count;
+  }
+  std::filesystem::create_directories(
+      output.parent_path().empty() ? "." : output.parent_path());
+  const auto temporary = TemporarySibling(output);
+  try {
+    std::ofstream destination(temporary, std::ios::binary | std::ios::trunc);
+    if (!destination)
+      throw ValidationError("unable to create merged GRIB temporary file");
+    for (const auto& [label, path] : inputs) {
+      (void)label;
+      std::ifstream source(path, std::ios::binary);
+      destination << source.rdbuf();
+      if (!source.eof() && source.fail())
+        throw ValidationError("failed reading input GRIB: " + PathToUtf8(path));
+      if (!destination) throw ValidationError("failed writing merged GRIB");
+    }
+    destination.close();
+    const auto scan = ScanGribMessages(temporary);
+    if (scan.message_count != expected)
+      throw ValidationError("merged GRIB message count mismatch");
+    Json::Value inspection = InspectGrib(temporary);
+    std::error_code error;
+    std::filesystem::rename(temporary, output, error);
+    if (error)
+      throw ValidationError("publishing merged GRIB failed: " +
+                            error.message());
+    return {counts, scan.message_count, scan.byte_count, inspection};
+  } catch (...) {
+    std::error_code ignored;
+    std::filesystem::remove(temporary, ignored);
+    throw;
+  }
+}
+
+namespace {
+
+bool CountPresent(const Json::Value& object, const std::string& key) {
+  return object.isObject() && object.get(key, 0).asUInt64() > 0;
+}
+
+bool HasWindPair(const Json::Value& inspection) {
+  const auto& short_names = inspection["short_name_counts"];
+  const auto& parameters = inspection["parameter_counts"];
+  const bool u = CountPresent(short_names, "10u") ||
+                 CountPresent(short_names, "u10") ||
+                 CountPresent(parameters, "33");
+  const bool v = CountPresent(short_names, "10v") ||
+                 CountPresent(short_names, "v10") ||
+                 CountPresent(parameters, "34");
+  return u && v;
+}
+
+bool HasCurrentPair(const Json::Value& inspection) {
+  const auto& currents = inspection["current_component_counts"];
+  return (currents.get("u_49", 0).asUInt64() > 0 &&
+          currents.get("v_50", 0).asUInt64() > 0) ||
+         (currents.get("u_grib2", 0).asUInt64() > 0 &&
+          currents.get("v_grib2", 0).asUInt64() > 0);
+}
+
+bool HasWaveField(const Json::Value& inspection) {
+  const auto& names = inspection["short_name_counts"];
+  for (const char* name : {"swh", "htsgw", "perpw", "dirpw", "mwp", "mwd",
+                           "shww", "mpww", "mdww"}) {
+    if (CountPresent(names, name)) return true;
+  }
+  return false;
+}
+
+bool RangesOverlap(double first_minimum, double first_maximum,
+                   double second_minimum, double second_maximum) {
+  return std::max(first_minimum, second_minimum) <=
+         std::min(first_maximum, second_maximum);
+}
+
+bool CoverageOverlaps(const Json::Value& first, const Json::Value& second) {
+  if (!first.isObject() || !second.isObject()) return false;
+  for (const auto& a : first["regions"]) {
+    for (const auto& b : second["regions"]) {
+      if (!RangesOverlap(a["south"].asDouble(), a["north"].asDouble(),
+                         b["south"].asDouble(), b["north"].asDouble()))
+        continue;
+      for (double shift : {-360.0, 0.0, 360.0}) {
+        if (RangesOverlap(a["west"].asDouble(), a["east"].asDouble(),
+                          b["west"].asDouble() + shift,
+                          b["east"].asDouble() + shift))
+          return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool TimeRangesOverlap(const Json::Value& first, const Json::Value& second) {
+  if (!first.isMember("first_valid_time") ||
+      !first.isMember("last_valid_time") ||
+      !second.isMember("first_valid_time") ||
+      !second.isMember("last_valid_time"))
+    return false;
+  return std::max(first["first_valid_time"].asString(),
+                  second["first_valid_time"].asString()) <=
+         std::min(first["last_valid_time"].asString(),
+                  second["last_valid_time"].asString());
+}
+
+void AppendUnique(std::vector<std::string>& destination,
+                  const std::string& value) {
+  if (std::find(destination.begin(), destination.end(), value) ==
+      destination.end())
+    destination.push_back(value);
+}
+
+}  // namespace
+
+EnvironmentalMergeResult MergeEnvironmentalGribs(
+    const EnvironmentalMergeRequest& request) {
+  EnvironmentalMergeResult result;
+  result.output = request.output;
+  if (request.output.empty()) {
+    result.errors.emplace_back("an output GRIB path is required");
+    return result;
+  }
+
+  const std::vector<
+      std::pair<std::string, std::optional<std::filesystem::path>>>
+      requested{{"weather", request.weather},
+                {"current", request.current},
+                {"waves", request.waves}};
+  std::vector<std::pair<std::string, std::filesystem::path>> inputs;
+  std::map<std::string, Json::Value> inspections;
+  for (const auto& [role, path] : requested) {
+    if (!path) continue;
+    Json::Value validation(Json::objectValue);
+    validation["path"] = path->string();
+    validation["valid"] = false;
+    try {
+      const auto inspection = InspectGrib(*path);
+      bool role_valid = role == "weather"   ? HasWindPair(inspection)
+                        : role == "current" ? HasCurrentPair(inspection)
+                                            : HasWaveField(inspection);
+      validation["role_valid"] = role_valid;
+      validation["inspection"] = inspection;
+      if (!role_valid) {
+        const std::string error =
+            role + " input does not contain a recognized paired " +
+            (role == "weather"   ? "U/V wind field"
+             : role == "current" ? "U/V current field"
+                                 : "wave field");
+        validation["error"] = error;
+        result.errors.push_back(error + ": " + path->string());
+      } else {
+        validation["valid"] = true;
+        inputs.emplace_back(role, *path);
+        inspections.emplace(role, inspection);
+        result.input_message_counts[role] =
+            inspection["message_count"].asUInt64();
+        for (const auto& field : ObjectKeys(inspection["short_name_counts"]))
+          AppendUnique(result.fields_discovered, field);
+        for (const auto& time : inspection["valid_times"])
+          AppendUnique(result.time_records_discovered, time.asString());
+      }
+    } catch (const std::exception& error) {
+      validation["error"] = error.what();
+      result.errors.push_back(role + " input is invalid: " + error.what());
+    }
+    result.input_validation[role] = validation;
+  }
+
+  if (!request.weather && !request.current && !request.waves)
+    result.errors.emplace_back(
+        "at least one weather, current, or wave input is required");
+
+  if (inspections.count("weather") && inspections.count("current")) {
+    const auto& weather = inspections.at("weather");
+    const auto& current = inspections.at("current");
+    if (!CoverageOverlaps(weather["coverage"], current["coverage"]))
+      result.errors.emplace_back(
+          "weather and current GRIB geographic coverage does not overlap");
+    if (!TimeRangesOverlap(weather, current))
+      result.errors.emplace_back(
+          "weather and current GRIB valid-time ranges do not overlap. Weather: " +
+          weather["first_valid_time"].asString() + " to " + weather["last_valid_time"].asString() +
+          " UTC; currents: " + current["first_valid_time"].asString() + " to " +
+          current["last_valid_time"].asString() +
+          " UTC. Increase weather duration or adjust the current start time to obtain a common period.");
+    const auto& weather_times = weather["valid_times"];
+    const auto& current_times = current["valid_times"];
+    if (weather_times != current_times)
+      result.warnings.emplace_back(
+          "weather and current time records differ; their compatible union "
+          "will be retained");
+  }
+  if (!result.errors.empty()) return result;
+
+  try {
+    const auto merged =
+        MergeGribStreams(inputs, request.output, request.overwrite);
+    result.input_message_counts = merged.input_message_counts;
+    result.output_message_count = merged.output_message_count;
+    result.byte_count = merged.byte_count;
+    result.output_inspection = InspectGrib(request.output);
+    result.fields_written =
+        ObjectKeys(result.output_inspection["short_name_counts"]);
+    result.success = true;
+  } catch (const std::exception& error) {
+    result.errors.push_back(error.what());
+  }
+  return result;
+}
+
+Json::Value EnvironmentalMergeResultJson(
+    const EnvironmentalMergeResult& result) {
+  Json::Value value(Json::objectValue);
+  value["success"] = result.success;
+  value["output"] = PathToUtf8(result.output);
+  value["output_message_count"] = Json::UInt64(result.output_message_count);
+  value["byte_count"] = Json::UInt64(result.byte_count);
+  for (const auto& [label, count] : result.input_message_counts)
+    value["input_message_counts"][label] = Json::UInt64(count);
+  value["input_validation"] = result.input_validation;
+  value["output_inspection"] = result.output_inspection;
+  AddStringArray(value["fields_discovered"], result.fields_discovered);
+  AddStringArray(value["time_records_discovered"],
+                 result.time_records_discovered);
+  AddStringArray(value["fields_written"], result.fields_written);
+  AddStringArray(value["warnings"], result.warnings);
+  AddStringArray(value["errors"], result.errors);
+  return value;
+}
+
+GribTimeInventory ReadGribTimeInventory(const std::filesystem::path& path) {
+  const auto close_file = [](FILE* value) { std::fclose(value); };
+  std::unique_ptr<FILE, decltype(close_file)> file(OpenFileForReading(path), close_file);
+  if (!file) throw ValidationError("unable to open GRIB: " + PathToUtf8(path));
+  GribTimeInventory instant, interval;
+  while (true) {
+    CheckCancellation();
+    int error = 0;
+    HandlePtr handle(codes_handle_new_from_file(nullptr, file.get(), PRODUCT_GRIB, &error), &codes_handle_delete);
+    if (!handle) {
+      if (error == CODES_SUCCESS || error == CODES_END_OF_FILE) break;
+      Check(error, "reading GRIB time headers");
+    }
+    const auto time = ValidityTime(handle.get());
+    if (!time) throw ValidationError("GRIB message has no valid UTC timestamp: " + PathToUtf8(path));
+    auto name = GetString(handle.get(), "shortName").value_or("unknown");
+    if (name.empty() || name == "unknown") {
+      const auto parameter = GetLong(handle.get(), "indicatorOfParameter");
+      name = "parameter-" + std::to_string(parameter.value_or(
+          GetLong(handle.get(), "paramId").value_or(-1)));
+    }
+    // WMO GRIB1 table 2 current components have different short names in
+    // supported ecCodes releases. Use their stable standard parameter codes
+    // for coverage identity and labels, including preferred/fallback unions.
+    if (GetLong(handle.get(), "editionNumber") == 1 &&
+        GetLong(handle.get(), "table2Version") == 2) {
+      const auto parameter = GetLong(handle.get(), "indicatorOfParameter");
+      if (parameter == 49 || parameter == 50)
+        name = "parameter-" + std::to_string(*parameter);
+    }
+    auto level_type = GetString(handle.get(), "typeOfLevel").value_or("");
+    const auto level = GetLong(handle.get(), "level").value_or(0);
+    // UKV's converted mean sea-level pressure can carry surface/0 while
+    // GFS uses meanSea/0. The parameter identifies the same physical field.
+    // Normalise only this known equivalence for coverage assessment; retain
+    // all original messages and keep other parameters/levels distinct.
+    if ((name == "prmsl" || name == "msl") && level == 0 &&
+        (level_type == "surface" || level_type == "meanSea")) {
+      name = "prmsl";
+      level_type = "meanSea";
+    }
+    const auto key = name + "|" + level_type + "|" + std::to_string(level);
+    const auto step_type = GetString(handle.get(), "stepType").value_or("instant");
+    // Accumulations and extrema describe intervals, not instantaneous coverage.
+    // Their initial record can legitimately be absent at lead zero.
+    (step_type == "instant" ? instant : interval)[key].insert(*time);
+  }
+  if (instant.empty()) instant = std::move(interval);
+  if (instant.empty()) throw ValidationError("GRIB has no time records: " + PathToUtf8(path));
+  return instant;
+}
+
+std::size_t FilterGribTimes(const std::filesystem::path& input,
+                     const std::filesystem::path& output,
+                     TimePoint from, TimePoint through,
+                     const std::set<TimePoint>& selected) {
+  const auto close_file = [](FILE* value) { std::fclose(value); };
+  std::unique_ptr<FILE, decltype(close_file)> file(OpenFileForReading(input), close_file);
+  if (!file) throw ValidationError("unable to open GRIB: " + PathToUtf8(input));
+  if (input == output) throw ValidationError("time-selected output must differ from input");
+  std::ofstream destination(output, std::ios::binary | std::ios::trunc);
+  if (!destination) throw ValidationError("unable to create time-selected GRIB");
+  std::size_t retained = 0;
+  while (true) {
+    CheckCancellation();
+    int error = 0;
+    HandlePtr handle(codes_handle_new_from_file(nullptr, file.get(), PRODUCT_GRIB, &error), &codes_handle_delete);
+    if (!handle) {
+      if (error == CODES_SUCCESS || error == CODES_END_OF_FILE) break;
+      Check(error, "reading GRIB time headers");
+    }
+    const auto time = ValidityTime(handle.get());
+    if (!time) throw ValidationError("cannot select a GRIB message without a valid UTC timestamp");
+    if (*time < from || *time > through || (!selected.empty() && !selected.count(*time))) continue;
+    const void* bytes = nullptr;
+    std::size_t length = 0;
+    Check(codes_get_message(handle.get(), &bytes, &length), "reading encoded GRIB message");
+    destination.write(static_cast<const char*>(bytes), static_cast<std::streamsize>(length));
+    if (!destination) throw ValidationError("failed writing time-selected GRIB");
+    ++retained;
+  }
+  destination.close();
+  if (!destination) throw ValidationError("failed closing time-selected GRIB");
+  return retained;
+}
+
+MergeStreamsResult CompositeGribStreamsPreferFirst(
+    const std::vector<std::pair<std::string, std::filesystem::path>>& inputs,
+    const std::filesystem::path& output, bool overwrite,
+    std::optional<TimePoint> valid_from,
+    std::optional<TimePoint> valid_through) {
+  if (inputs.empty())
+    throw ValidationError("at least one GRIB input is required");
+  if (std::filesystem::exists(output) && std::filesystem::is_directory(output))
+    throw ValidationError("output must be a file path, not a directory");
+  if (std::filesystem::exists(output) && !overwrite)
+    throw ValidationError("output already exists: " + PathToUtf8(output) +
+                          "; use --overwrite to replace it");
+
+  std::map<std::string, std::size_t> counts;
+  for (const auto& [label, path] : inputs) {
+    if (!std::filesystem::is_regular_file(path))
+      throw ValidationError(label + " GRIB not found: " + PathToUtf8(path));
+    counts[label] = ScanGribMessages(path).message_count;
+  }
+
+  std::filesystem::create_directories(
+      output.parent_path().empty() ? "." : output.parent_path());
+  const auto temporary = TemporarySibling(output);
+  std::set<std::string> retained;
+  std::size_t output_count = 0;
+  try {
+    std::ofstream destination(temporary, std::ios::binary | std::ios::trunc);
+    if (!destination)
+      throw ValidationError("unable to create composite GRIB temporary file");
+
+    for (const auto& [label, path] : inputs) {
+      FILE* raw = OpenFileForReading(path);
+      if (!raw)
+        throw ValidationError("unable to open " + label +
+                              " GRIB: " + PathToUtf8(path));
+      struct FileCloser {
+        void operator()(FILE* value) const { std::fclose(value); }
+      };
+      std::unique_ptr<FILE, FileCloser> file(raw);
+      std::size_t source_index = 0;
+      while (true) {
+        int error = 0;
+        HandlePtr handle(codes_handle_new_from_file(nullptr, file.get(),
+                                                    PRODUCT_GRIB, &error),
+                         &codes_handle_delete);
+        if (!handle) {
+          if (error == CODES_SUCCESS || std::feof(file.get())) break;
+          Check(error, "reading " + label + " GRIB message");
+          break;
+        }
+
+        if (const auto validity = ValidityTime(handle.get()); validity) {
+          if ((valid_from && *validity < *valid_from) ||
+              (valid_through && *validity > *valid_through))
+            continue;
+        }
+
+        auto short_name = GetString(handle.get(), "shortName");
+        if (!short_name || short_name->empty() || *short_name == "unknown") {
+          if (const auto parameter =
+                  GetLong(handle.get(), "indicatorOfParameter"))
+            short_name = "parameter-" + std::to_string(*parameter);
+          else if (const auto parameter = GetLong(handle.get(), "paramId"))
+            short_name = "parameter-" + std::to_string(*parameter);
+        }
+        const auto level_type =
+            GetString(handle.get(), "typeOfLevel").value_or("unknown-level");
+        const auto level = GetLong(handle.get(), "level");
+        const auto date = GetLong(handle.get(), "validityDate");
+        const auto time = GetLong(handle.get(), "validityTime");
+        std::string key;
+        if (short_name && date && time) {
+          key = *short_name + '|' + level_type + '|' +
+                std::to_string(level.value_or(0)) + '|' +
+                std::to_string(*date) + '|' + std::to_string(*time);
+        } else {
+          // Preserve unusual messages which do not expose the standard
+          // semantic keys; they cannot safely be classified as duplicates.
+          key = label + "|unclassified|" + std::to_string(source_index);
+        }
+        ++source_index;
+        if (!retained.insert(key).second) continue;
+
+        const void* message = nullptr;
+        std::size_t length = 0;
+        Check(codes_get_message(handle.get(), &message, &length),
+              "reading encoded " + label + " GRIB message");
+        destination.write(static_cast<const char*>(message),
+                          static_cast<std::streamsize>(length));
+        if (!destination)
+          throw ValidationError("failed writing composite GRIB");
+        ++output_count;
+      }
+    }
+    destination.close();
+    const auto scan = ScanGribMessages(temporary);
+    if (scan.message_count != output_count)
+      throw ValidationError("composite GRIB message count mismatch");
+    Json::Value inspection = InspectGrib(temporary);
+    std::error_code error;
+    std::filesystem::rename(temporary, output, error);
+    if (error)
+      throw ValidationError("publishing composite GRIB failed: " +
+                            error.message());
+    return {counts, scan.message_count, scan.byte_count, inspection};
+  } catch (...) {
+    std::error_code ignored;
+    std::filesystem::remove(temporary, ignored);
+    throw;
+  }
+}
+
+}  // namespace environmental_grib

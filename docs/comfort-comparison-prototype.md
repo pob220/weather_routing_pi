@@ -52,7 +52,7 @@ Bounds per departure are:
 - Existing native memory limits remain; extra Standard search uses at most 64 MiB and retained native state/graph-label ceilings are 32,768.
 - The configured percentage allowance and seconds cap apply to the complete extra phase, including validation. Deadlines are cooperative: an in-flight provider or host call can overrun. Attempts receive smaller slices so one refinement cannot spend the complete allowance before detours are tested.
 
-**Stop exploration; keep results** in the progress dialog stops currently active extra phases and preserves the ordinary route and already accepted extras. It does not suppress later queued departures. **Stop all computations** retains its existing whole-operation cancellation behaviour. Expiry, exhausted work, missing data or failed optional attempts preserve the ordinary result.
+**Stop exploration - keep results** in the progress dialog stops currently active extra phases and preserves the ordinary route and already accepted extras. It does not suppress later queued departures. **Stop all computations** retains its existing whole-operation cancellation behaviour. Expiry, exhausted work, missing data or failed optional attempts preserve the ordinary result.
 
 The comparison's **Rank by wind comfort only** preference is snapshotted at computation start. Available waves remain in the independent worst-known-leg metric and delivered legs. Full-condition comfort candidates require complete wind and wave-height data. Existing hard wind, wave, propulsion, land, boundary and chart constraints still apply in either mode.
 

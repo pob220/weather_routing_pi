@@ -45,7 +45,7 @@ set(WEATHER_ROUTING_EXPECTED_WX_VERSION "" CACHE STRING
     "Require this exact wxWidgets version when building a pinned host package")
 
 # define minimum cmake version
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.20)
 if(COMMAND cmake_policy)
   if (POLICY CMP0043)
     cmake_policy(SET CMP0043 NEW)
@@ -88,13 +88,13 @@ else()
 endif()
 set(PACKAGE_CONTACT "Sean d'Epagnier; Weather Routing Plugin Team")
 set(SHORT_DESCRIPTION
-    "Weather routing with six engines, diagnostics and coverage warnings.")
+    "Integrated passage planning: route, boat, polars and weather.")
 set(LONG_DESCRIPTION
-    "Optional automatic adaptive settings choose nominal numerical inputs on calculation-local copies and retain manual values. Route details retain setup errors, coverage warnings, actual fallback use and every engine attempt. Copy a diagnostic report for support without finding logs. Successful routes identify climatology, assumed zero current, missing or estimated waves, endpoint clearance and anchoring assumptions. The boat editor keeps the polar list and its add, edit, remove and reorder controls visible. A separate Wind range page applies low- and high-wind handling to the selected polar, preserving multiple-polars boats, crossover selection and saved XML settings. Desktop tabs and the Android touch page selector provide the same settings. Failed All searches can retain bounded independently replayed prefixes for inspection. Partial results show their actual endpoint and remaining straight-line distance; they do not imply destination arrival or enable completed-passage exports. Live chart progress shows bounded search fronts and a provisional explored path while visible routes are calculating. Previews are labelled as unvalidated and do not change route acceptance. Motoring follows the configured STW threshold: when the best usable sailing performance is below it, motor-only routing can use headings outside sailing-angle limits, including directly into wind. Sailing, motor-sailing and stronger-wind motoring retain those limits; other safety checks still apply. Consistent route visibility: the eye hides all route overlays even when selected, and hidden computations stay hidden at completion. Clear computed results releases courses, contours and result data while preserving route settings for recomputation. Departure optimisation can show only the selected departure, all departures or a manually chosen subset, with matching chart and eye state and no recomputation. Improved optional chart-awareness performance with a compatible enhanced host; stock OpenCPN retains ordinary weather routing and GSHHG land avoidance. Check existing OpenCPN routes for charted land, drying areas, hazards, clearance and optional minimum depth without altering their waypoints. A per-leg report and chart markers distinguish hazards from unavailable coverage or depth; cancellation produces a partial report and route or chart changes invalidate results. Chart checks require a compatible host. Basic routing offers Auto and All (slow), with individual engines and independent Auto/All membership in Advanced. The Atlas engine adds continuous physical connection solving, adaptive spatial decisions and time-dependent weather guidance with independent route validation. The available order is Quick, Quick2, Atlas, Standard, Alternative and Professional, skipping unchecked engines. Fresh installations select all six engines for Auto and All. Explicit saved engine memberships are preserved. Auto stops at the first accepted validated route, including Quick2. All compares every selected engine. Quick2 is an independent bounded CPU frontier search using the shared motion kernel, original safety providers and authoritative replay; no GPU is required. A bounded extra-search allowance is shared across retained candidates. Optional fastest/comfort alternatives also work with individual engines and Auto, with saved percentage and seconds limits. A retained-route comparison table and slider balance passage time against discomfort exposure while preserving the worst known leg. Wind-only ranking is enabled by default and remembered. Extra comfort limits never reduce the ordinary engines' budgets; All initially selects the earliest validated arrival. Quick uses hardened contour routing with independent chronological validation. Standard provides bounded adaptive search; Professional preserves validated incumbents, uses unrestricted and focused native recovery as appropriate, and enforces the requested arrival horizon. All support plugin-managed GSHHG shorelines; optional chart-backed safety requires a compatible host.")
+    "${COMMON_NAME} 2.2.6 adds optional automatic adaptive routing settings and brings route setup, a searchable polar library, boat and polar editing, independent GRIB loading and generation, with optional xGRIB chart display into one passage-planning workflow. Includes an illustrative 40 ft monohull and the complete Climatology 2026.2 dataset. A compatible installed Climatology provider with newer data takes precedence. The existing routing engines, reports, OpenCPN route analysis, multi-leg passages and optional chart-aware safety remain available. Ordinary routing and GSHHG land avoidance work on stock OpenCPN; chart-backed checks require a compatible enhanced host. Uses separate version 2 preferences and user data. Version 1 remains the stable catalogue line while this separate development branch is qualified.")
 
-set(VERSION_MAJOR "1")
-set(VERSION_MINOR "36")
-set(VERSION_PATCH "3")
+set(VERSION_MAJOR "2")
+set(VERSION_MINOR "2")
+set(VERSION_PATCH "6")
 set(VERSION_TWEAK "0")
 # Keep all five approved source archives for verification and regression tests.
 # Packages ship only Crude, Low and Intermediate; High and Full are optional
@@ -217,6 +217,14 @@ project(${PACKAGE})
 if(MSVC)
   add_compile_options(/Zc:__cplusplus)
 endif()
+if(WIN32)
+  # Windows headers otherwise rewrite std::min/max and numeric_limits::max.
+  add_compile_definitions(NOMINMAX)
+  if(MSVC)
+    # Labels and boat/polar metadata use UTF-8 regardless of the build locale.
+    add_compile_options(/utf-8)
+  endif()
+endif()
 
 set(CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
@@ -257,6 +265,26 @@ SET(SRCS
             src/AppendOnlyCache.cpp
             src/ChartSafetyCache.cpp
             src/ClimatologyCompatibility.cpp
+            src/BundledClimatology.cpp
+            src/ClimatologyMath.cpp
+            src/PassageWeather.cpp
+            src/PassageWeatherRequest.cpp
+            src/PassageReadiness.cpp
+            src/PassageSettings.cpp
+            src/PlanningHelp.cpp
+            src/RunDiagnosticsJournal.cpp
+            src/PassagePanel.cpp
+            src/PlanningTimeCtrl.cpp
+            src/PassagePresentation.cpp
+            src/EnvironmentalGribDialog.cpp
+            src/AreaPreset.cpp
+            src/AreaPresetManagerDialog.cpp
+            src/GeneratorJobJson.cpp
+            src/ProcessCommand.cpp
+            src/XgribPaths.cpp
+            src/GribReader.cpp
+            src/GribV1Record.cpp
+            src/GribV2Record.cpp
             src/PluginWaypointLists.cpp
             src/ChartSafetyAtlas.cpp
             src/ChartHazardEvaluator.cpp
@@ -337,7 +365,8 @@ SET(SRCS
 )
 
 if(QT_ANDROID)
-  list(APPEND SRCS src/AndroidWeatherRouting.cpp)
+  list(APPEND SRCS src/AndroidWeatherRouting.cpp
+    src/android/PassageWeatherGenerator.cpp)
 endif()
 
 SET (HDRS
@@ -529,8 +558,16 @@ if (NOT OCPN_FLATPAK_CONFIG)
   add_subdirectory(opencpn-libs/odapi)
   target_link_libraries(${PACKAGE_NAME} PRIVATE ocpn::odapi)
 
-  add_subdirectory(opencpn-libs/jsonlib)
-  target_link_libraries(${PACKAGE_NAME} PRIVATE ocpn::jsonlib)
+  if(QT_ANDROID)
+    # The in-process generator and host adapter must use one JSON ABI.
+    # Mixing the legacy bundled headers/runtime with modern jsoncpp corrupts
+    # values and also introduces duplicate symbols when the worker is linked.
+    find_package(jsoncpp CONFIG REQUIRED)
+    target_link_libraries(${PACKAGE_NAME} PRIVATE JsonCpp::JsonCpp)
+  else()
+    add_subdirectory(opencpn-libs/jsonlib)
+    target_link_libraries(${PACKAGE_NAME} PRIVATE ocpn::jsonlib)
+  endif()
 
   add_subdirectory(opencpn-libs/plugin_dc)
   if(TARGET _DC_UTILS AND TARGET wx::core)
@@ -589,6 +626,7 @@ endif (QT_ANDROID)
 ##===============================================================
 
 include("PluginInstall")
+include("IntegratedWeather")
 include("PluginLocalization")
 include("PluginPackage")
 

@@ -1,0 +1,10 @@
+cmake_minimum_required(VERSION 3.20)
+project(xweather_engine_lab LANGUAGES CXX)
+# Separate executable: never linked to or registered with the plugin.
+set(ATLAS_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+add_subdirectory(../../vendor/atlas-routing-engine atlas)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(JSONCPP REQUIRED IMPORTED_TARGET jsoncpp)
+add_executable(atlas2test Atlas2Test.cpp)
+target_include_directories(atlas2test PRIVATE ../../vendor/atlas-routing-engine/tests)
+target_link_libraries(atlas2test PRIVATE atlas_routing_engine PkgConfig::JSONCPP)

@@ -47,7 +47,9 @@ ClimatologyMessage ReadClimatologyMessage(const std::string& message) {
   result.major = value["ClimatologyVersionMajor"].asInt();
   result.minor = value["ClimatologyVersionMinor"].asInt();
   result.valid = true;
-  result.supported = SupportedVersion(result.major, result.minor);
+  result.supported = SupportedVersion(result.major, result.minor) ||
+      (value["ClimatologyQueryAPIVersion"].isInt() &&
+       value["ClimatologyQueryAPIVersion"].asInt() == 1);
   if (!result.supported) return result;
 
   ClimatologyMessage callbacks;

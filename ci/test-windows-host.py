@@ -59,8 +59,8 @@ def test(host, archive_path, output, source, host_version='5.14.2'):
         # A CI profile has no customised boat/polar data to migrate. Record
         # the current data version so its interactive migration choice does
         # not block the scenario inside WeatherRouting's constructor.
-        '[Plugins/WeatherRouting]\nConfigVersion=' + str(config_version) + '\n'
-        '[PlugIns/WeatherRouting]\nConfigVersion=' + str(config_version) + '\n',
+        '[Plugins/xWeatherRouting2]\nConfigVersion=' + str(config_version) + '\n'
+        '[PlugIns/xWeatherRouting2]\nConfigVersion=' + str(config_version) + '\n',
         encoding='ascii')
     # Absolute paths make the fixture independent of user polar directories.
     polar = host / 'plugins' / package / 'data/polars/Example/Test-TWS-0-20+60.pol'
@@ -87,6 +87,7 @@ def test(host, archive_path, output, source, host_version='5.14.2'):
     scenario_path = output / 'scenario.json'
     scenario_path.write_text(json.dumps(scenario, indent=2) + '\n')
     result_path = output / 'route-result.json'
+    result_path.unlink(missing_ok=True)
     env = dict(os.environ, WR_HEADLESS_ROUTE_TEST='scenario',
                WR_HEADLESS_SCENARIO=str(scenario_path.resolve()),
                WR_HEADLESS_OUTPUT=str(result_path.resolve()),
@@ -129,6 +130,45 @@ def test(host, archive_path, output, source, host_version='5.14.2'):
             'route_lifecycle_checked': lifecycle,
         }, indent=2) + '\n')
         print('Genuine upstream host loaded the packaged plugin and completed its route', flush=True)
+        weather_receipts = []
+        for label, use_grib, longitude in [('climatology-only', False, -5.3),
+                                           ('forecast-expiry-fallback', True, -4.9)]:
+            scenario['name'] = 'Windows v2 ' + label
+            scenario['end']['lon'] = longitude
+            scenario['environment'].update(useGrib=use_grib, allowClimatologyFallback=True)
+            scenario['route']['routingEngine'] = 'quick'
+            scenario_path = output / (label + '-scenario.json')
+            result_path = output / (label + '-result.json')
+            result_path.unlink(missing_ok=True)
+            scenario_path.write_text(json.dumps(scenario, indent=2) + '\n')
+            env.update(WR_HEADLESS_SCENARIO=str(scenario_path.resolve()),
+                       WR_HEADLESS_OUTPUT=str(result_path.resolve()))
+            if use_grib:
+                env['WR_HEADLESS_GRIB_FILE'] = str((source / 'ci/testdata/irish-sea-three-hour-wind.grb').resolve())
+            else:
+                env.pop('WR_HEADLESS_GRIB_FILE', None)
+            with (output / (label + '-stdout.log')).open('w') as stdout:
+                process = subprocess.Popen([str(host / 'opencpn.exe'), '-p'],
+                    cwd=host, env=env, stdout=stdout, stderr=subprocess.STDOUT)
+                try:
+                    code = process.wait(timeout=120)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                    raise RuntimeError('Windows v2 weather route timed out: ' + label)
+            if not result_path.is_file():
+                raise RuntimeError('Windows v2 weather route produced no result: ' + label)
+            result = json.loads(result_path.read_text())
+            codes = {item['code'] for candidate in result.get('candidates', [])
+                     for item in candidate.get('diagnostics', {}).get('items', [])}
+            if code != 0 or result.get('status') != 'complete' or 'usage.climatology_wind' not in codes:
+                raise RuntimeError(f'Windows v2 weather route failed: {label}; exit={code}; {result}')
+            weather_receipts.append({'case': label, 'status': result['status'],
+                                     'climatology_wind_used': True, 'exit_code': code})
+            if log.is_file():
+                shutil.copy2(log, output / (label + '-opencpn.log'))
+            print('Packaged Windows v2 weather route passed:', label, flush=True)
+        (output / 'acceptance-v2-weather.json').write_text(json.dumps(weather_receipts, indent=2) + '\n')
     finally:
         if log.is_file():
             shutil.copy2(log, output / 'opencpn.log')

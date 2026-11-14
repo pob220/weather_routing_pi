@@ -46,7 +46,7 @@ struct Config {
   wxString previous;
   Config() {
     previous = c->GetPath();
-    c->SetPath("/PlugIns/WeatherRouting/Shoreline");
+    c->SetPath("/PlugIns/xWeatherRouting2/Shoreline");
   }
   ~Config() { c->SetPath(previous); }
   wxString Read(const wxString& key, const wxString& fallback = "") {
@@ -76,7 +76,7 @@ std::filesystem::path Root() {
       !overridePath.empty())
     return Path(overridePath) / "2.3.7";
   return Path(*GetpPrivateApplicationDataLocation()) / "plugins" /
-         "weather_routing" / "shoreline" / "2.3.7";
+         "xweather_routing_v2" / "shoreline" / "2.3.7";
 }
 std::filesystem::path Archive(const Spec& s) {
   if (!Bundled(s)) return {};
@@ -280,7 +280,7 @@ void InstallOptional(const Spec& s, wxWindow* parent) {
         const auto result = OCPN_downloadFile(
             wxString::FromUTF8(source.c_str()), outputPath,
             _("Downloading shoreline data"),
-            wxString::Format(_("GSHHG 2.3.7 — %s"), wxGetTranslation(s.quality)),
+            wxString::Format(_(L"GSHHG 2.3.7 — %s"), wxGetTranslation(s.quality)),
             wxNullBitmap, parent,
             OCPN_DLDS_ELAPSED_TIME | OCPN_DLDS_ESTIMATED_TIME |
                 OCPN_DLDS_REMAINING_TIME | OCPN_DLDS_SPEED | OCPN_DLDS_SIZE |
@@ -374,7 +374,7 @@ void ShorelineManager::Show(wxWindow* parent) {
     choice->Append(wxString::Format("%d - %s", q,
                                     wxGetTranslation(kShorelineSpecs[q].quality)));
 #else
-    choice->Append(wxString::Format("%d — %s", q, wxGetTranslation(kShorelineSpecs[q].quality)));
+    choice->Append(wxString::Format(L"%d — %s", q, wxGetTranslation(kShorelineSpecs[q].quality)));
 #endif
   choice->SetSelection(DefaultResolution());
   main->Add(choice, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
@@ -422,7 +422,7 @@ void ShorelineManager::Show(wxWindow* parent) {
 #ifdef __OCPN__ANDROID__
       _("Install High + Full..."));
 #else
-      _("Install / update High and Full (3–4)..."));
+      _(L"Install / update High and Full (3–4)..."));
 #endif
   installHighRes->SetToolTip(_(
       "Download and verify both optional GSHHG resolutions. "
@@ -484,7 +484,7 @@ void ShorelineManager::Show(wxWindow* parent) {
         wxGetTranslation(s.quality), state));
 #else
     status->SetLabel(wxString::Format(
-        _("Approved dataset: GSHHG 2.3.7 — %s\n%s"),
+        _(L"Approved dataset: GSHHG 2.3.7 — %s\n%s"),
         wxGetTranslation(s.quality), state));
 #endif
     restore->SetLabel(Bundled(s) ? _("Restore selected bundled data")

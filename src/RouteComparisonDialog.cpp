@@ -101,7 +101,7 @@ RouteComparisonDialog::RouteComparisonDialog(WeatherRouting& routing, bool parti
   m_WindOnly = new wxCheckBox(content, wxID_ANY, _("Rank by wind comfort only"));
   auto* config = GetOCPNConfigObject();
   m_WindOnly->SetValue(!config || config->ReadBool(
-      "/PlugIns/WeatherRouting/ComfortComparisonWindOnly", true));
+      "/PlugIns/xWeatherRouting2/ComfortComparisonWindOnly", true));
   m_WindOnly->SetToolTip(_("Exclude waves from comfort ranking. The worst known leg still includes available waves. Route validation is unchanged."));
   layout->Add(m_WindOnly, 0, wxALL, 6);
   auto* explorationHelp = new wxStaticText(content, wxID_ANY,
@@ -216,7 +216,7 @@ RouteComparisonDialog::RouteComparisonDialog(WeatherRouting& routing, bool parti
   m_Slider->Bind(wxEVT_SLIDER, [this](wxCommandEvent&) { Choose(); });
   m_WindOnly->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent&) {
     if (auto* config = GetOCPNConfigObject()) {
-      config->Write("/PlugIns/WeatherRouting/ComfortComparisonWindOnly", m_WindOnly->GetValue());
+      config->Write("/PlugIns/xWeatherRouting2/ComfortComparisonWindOnly", m_WindOnly->GetValue());
       config->Flush();
     }
     Populate(); Choose();
@@ -354,7 +354,7 @@ void RouteComparisonDialog::RunHostContract(bool lifecycle) {
     m_WindOnly->GetEventHandler()->ProcessEvent(mode);
     if (auto* config = GetOCPNConfigObject())
       passed = passed && config->ReadBool(
-          "/PlugIns/WeatherRouting/ComfortComparisonWindOnly", !windOnly) == windOnly;
+          "/PlugIns/xWeatherRouting2/ComfortComparisonWindOnly", !windOnly) == windOnly;
     for (long row = 0; row < m_List->GetItemCount(); ++row) {
       const auto& full = m_Entries[m_List->GetItemData(row)].fullComfort;
       passed = passed && m_List->GetItemText(row, 9) == WorstKnownText(full) &&

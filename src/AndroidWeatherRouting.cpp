@@ -24,6 +24,12 @@
 #include "WeatherRoutingWxCompat.h"
 #include "AndroidDialogHeader.h"
 #include "weather_routing_pi.h"
+#include "PassageWeather.h"
+#include "PassageReadiness.h"
+#include "Boat.h"
+#include "RouteWaypointExtractor.h"
+#include "WeatherRoutingFileDialog.h"
+#include "android/PassageWeatherGenerator.h"
 
 namespace {
 
@@ -102,7 +108,7 @@ std::array<wxString, WeatherRouting::NUM_COLS> TabletRouteValues(const WeatherRo
 wxString TabletRouteState(const wxString& state) {
   if (state.Contains("retained lineage limit") ||
       state.Contains("graph label limit"))
-    return _("Search memory limit reached. Increase the Engine memory budget or use a coarser search.");
+    return _("Search allowance reached. The engine stopped at its configured search limit; this does not mean the device ran out of RAM. Try Automatic adaptive settings or another engine.");
   if (state.Contains("wall-clock limit"))
     return _("Search time limit reached. Try a shorter offshore time step or another engine.");
   if (state.Contains("candidate validation allowance"))
@@ -245,7 +251,8 @@ wxWindow* WeatherRouting::BuildAndroidWorkspace(wxBoxSizer* root) {
   auto* header = new wxPanel(this, wxID_ANY);
   header->SetBackgroundColour(wxColour(25, 59, 76));
   auto* headerSizer = new wxBoxSizer(wxHORIZONTAL);
-  auto* title = new wxStaticText(header, wxID_ANY, _("xWeatherRouting"));
+  auto* title = new wxStaticText(header, wxID_ANY,
+      wxString::FromUTF8(PLUGIN_COMMON_NAME));
   SetTabletFont(title, 21, true);
   title->SetForegroundColour(*wxWHITE);
   title->GetHandle()->setStyleSheet("QLabel { color: white; }");
@@ -293,6 +300,7 @@ wxWindow* WeatherRouting::BuildAndroidWorkspace(wxBoxSizer* root) {
     if (label == _("Pick start") || label == _("Pick destination"))
       m_androidPickButtons.push_back(button);
     if (label == _("Stop")) m_androidStopButtons.push_back(button);
+    if (label == _("Compute selected")) m_androidComputeSelected.push_back(button);
     if (label == _("Save all as tracks")) m_androidAnyResultButtons.push_back(button);
     if (label == _("Compute all") || label == _("Delete all"))
       m_androidAnyRouteButtons.push_back(button);
@@ -373,6 +381,15 @@ wxWindow* WeatherRouting::BuildAndroidWorkspace(wxBoxSizer* root) {
       {_("Compute selected"), command(&WeatherRouting::OnCompute)},
       {_("Show on chart"), showChart},
   });
+  m_androidReadinessStatus = new wxStaticText(plan, wxID_ANY, wxEmptyString);
+  SetTabletFont(m_androidReadinessStatus, 16);
+  planContent->Add(m_androidReadinessStatus, 0, wxEXPAND | wxALL, 14);
+  m_androidReadinessAction = new wxButton(plan, wxID_ANY, _("Review checks"));
+  StyleTabletButton(m_androidReadinessAction);
+  m_androidReadinessAction->SetMinSize(wxSize(170, 72));
+  m_androidReadinessAction->Bind(wxEVT_BUTTON,
+      [this](wxCommandEvent&) { ReviewAndroidReadiness(); });
+  planContent->Add(m_androidReadinessAction, 0, wxEXPAND | wxLEFT | wxRIGHT, 14);
   auto section = [this](size_t index) {
     return [this, index]() {
       OnEditConfiguration();
@@ -389,11 +406,23 @@ wxWindow* WeatherRouting::BuildAndroidWorkspace(wxBoxSizer* root) {
       {_("Pick start"), [this]() { BeginAndroidChartPick(0); }},
       {_("Pick destination"), [this]() { BeginAndroidChartPick(1); }},
   });
-  auto* forecastNote = new wxStaticText(
-      plan, wxID_ANY,
-      _("Forecast: load or generate weather with xGRIB on the OpenCPN toolbar."));
-  SetTabletFont(forecastNote, 16);
-  planContent->Add(forecastNote, 0, wxEXPAND | wxALL, 14);
+  AddHeading(plan, planContent, _("Passage weather"));
+  m_androidForecastStatus = new wxStaticText(plan, wxID_ANY, wxEmptyString);
+  SetTabletFont(m_androidForecastStatus, 16);
+  planContent->Add(m_androidForecastStatus, 0,
+                  wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 14);
+  auto* forecastActions = new wxBoxSizer(wxHORIZONTAL);
+  auto forecastAction = [&](const wxString& label, std::function<void()> action) {
+    auto* button = new wxButton(plan, wxID_ANY, label);
+    StyleTabletButton(button);
+    button->SetMinSize(wxSize(170, 72));
+    button->Bind(wxEVT_BUTTON, [action](wxCommandEvent&) { action(); });
+    forecastActions->Add(button, 1, wxEXPAND | wxALL, 5);
+    m_androidForecastActions.push_back(button);
+  };
+  forecastAction(_("Load GRIB"), [this] { LoadAndroidPassageWeather(); });
+  forecastAction(_("Download / generate"), [this] { GenerateAndroidPassageWeather(); });
+  planContent->Add(forecastActions, 0, wxEXPAND | wxALL, 10);
 
   auto* routes = new wxPanel(m_androidBook, wxID_ANY);
   auto* routesContent = new wxBoxSizer(wxVERTICAL);
@@ -593,8 +622,183 @@ wxWindow* WeatherRouting::BuildAndroidWorkspace(wxBoxSizer* root) {
   return routes;
 }
 
+void WeatherRouting::LoadAndroidPassageWeather() {
+  WR_FileDialog picker(this, _("Load passage weather"), wxEmptyString,
+      wxEmptyString, _("GRIB files|*.grb;*.grib;*.grb2;*.grib2;*.gz;*.bz2|All files|*.*"),
+      wxFD_OPEN | wxFD_FILE_MUST_EXIST);
+  if (picker.ShowModal() != wxID_OK) return;
+  wxString error;
+  if (!OpenPassageForecastForUser(picker.GetPath(), error))
+    WR_MessageBox(error, _("Cannot load weather"), wxOK | wxICON_INFORMATION, this);
+  RefreshAndroidWorkspace();
+}
+
+void WeatherRouting::GenerateAndroidPassageWeather() {
+  PlugIn_ViewPort viewport{};
+  if (!m_weather_routing_pi.CopyLastViewport(viewport)) {
+    WR_MessageBox(_("Return to the chart once, then reopen Weather Routing."),
+                  _("Chart area unavailable"), wxOK | wxICON_INFORMATION, this);
+    return;
+  }
+  if (!m_androidGenerator) {
+    m_androidGenerator = std::make_unique<AndroidPassageWeatherDialog>(this,
+        [this](const wxString& path) {
+          wxString error;
+          if (OpenPassageForecast(path, error)) m_androidGeneratedForecast = path;
+          else WR_MessageBox(error, _("Generated weather"), wxOK, this);
+        });
+  }
+  m_androidGeneratedForecast.clear();
+  m_androidGenerator->ShowMobile(viewport);
+  // A viewer must not take focus while the generator owns a modal Qt sheet.
+  if (!m_androidGeneratedForecast.empty())
+    RequestPassageWeatherDisplay(m_androidGeneratedForecast);
+  RefreshAndroidWorkspace();
+}
+
+void WeatherRouting::RefreshAndroidPassageWeather() {
+  if (!m_androidForecastStatus) return;
+  wxString text = m_PassageWeather->Loaded()
+      ? m_PassageWeather->Summary() + "\n" + m_PassageWeather->Details()
+      : _("No passage GRIB loaded. Use Load GRIB or Download / generate.\nClimatology remains available in Weather settings.");
+  WR_WrapAndroidText(m_androidForecastStatus, text,
+      wxMax(300, m_androidForecastStatus->GetParent()->GetClientSize().x - 80));
+  const bool idle = m_RunningRouteMaps.empty() && m_WaitingRouteMaps.empty() &&
+      !m_RoutePreparationDepth && !m_DeferredRoutingStartPending;
+  for (auto* button : m_androidForecastActions) button->Enable(idle);
+  if (auto* page = wxDynamicCast(m_androidForecastStatus->GetParent(), wxScrolledWindow)) {
+    page->Layout(); page->FitInside(); page->Layout();
+  }
+}
+
+void WeatherRouting::RefreshAndroidReadiness(RouteMapOverlay* route) {
+  if (!m_androidReadinessStatus) return;
+  m_androidReadinessCode.clear();
+  m_androidReadinessReport = {};
+  if (!route) {
+    m_androidReadinessStatus->SetLabel(_("Create a route, then check its boat and weather."));
+    m_androidReadinessAction->Enable(false);
+    for (auto* button : m_androidComputeSelected) button->Enable(false);
+    return;
+  }
+  auto c = route->GetConfiguration();
+  c.Update();
+  if (!m_androidReadinessBoat) m_androidReadinessBoat = std::make_unique<Boat>();
+  auto input = InspectPassageInputs(c, *m_androidReadinessBoat, m_androidClimateReady);
+  const auto readiness = weather_routing::EvaluatePassage(input);
+  m_androidReadinessReport = readiness.Report();
+  wxString status = readiness.Summary();
+  wxString action = _("Review checks");
+  if (const auto* blocker = readiness.FirstBlocker()) {
+    m_androidReadinessCode = blocker->code;
+    status += "\n" + blocker->detail;
+    if (!blocker->action.empty()) action = blocker->action;
+  } else if (readiness.Warnings()) {
+    status += wxString::Format(_(" / %u to review"), readiness.Warnings());
+  }
+  WR_WrapAndroidText(m_androidReadinessStatus, status,
+      wxMax(300, m_androidReadinessStatus->GetParent()->GetClientSize().x - 80));
+  m_androidReadinessAction->SetLabel(action);
+  const bool busy = !m_RunningRouteMaps.empty() || !m_WaitingRouteMaps.empty() ||
+      m_RoutePreparationDepth || m_DeferredRoutingStartPending;
+  m_androidReadinessAction->Enable(!busy);
+  for (auto* button : m_androidComputeSelected)
+    button->Enable(!busy && readiness.CanCalculate());
+}
+
+void WeatherRouting::ReviewAndroidReadiness() {
+  auto* route = FirstCurrentRouteMap();
+  if (!route) return;
+  RefreshAndroidReadiness(route);
+  if (m_androidReadinessCode.empty()) {
+    WR_MessageBox(m_androidReadinessReport.Text(), _("Passage checks"), wxOK, this);
+    return;
+  }
+  const auto code = m_androidReadinessCode;
+  if (code == "passage.route.coincident_waypoints") { EditAndroidRouteWaypoint(); return; }
+  if (code == "passage.limits.boundary_provider") {
+    DisablePassageDrawExclusions();
+    RefreshAndroidWorkspace();
+    return;
+  }
+  if (code == "passage.weather.departure" && !m_PassageWeather->Loaded()) {
+    LoadAndroidPassageWeather();
+    return;
+  }
+  // The same recovery classification drives the desktop and touch frontends.
+  int section = 3;
+  switch (weather_routing::RecoveryAction(code)) {
+    case weather_routing::PassageAction::Route: section = code == "passage.route.time" ? 1 : 0; break;
+    case weather_routing::PassageAction::Boat: section = 2; break;
+    case weather_routing::PassageAction::Limits: section = 4; break;
+    default: break;
+  }
+  OnEditConfiguration();
+  m_ConfigurationDialog.ShowAndroidSection(section);
+}
+
+void WeatherRouting::EditAndroidRouteWaypoint() {
+  auto* selected = FirstCurrentRouteMap();
+  if (!selected) return;
+  const auto c = selected->GetConfiguration();
+  const wxString guid = c.IsMultiLegGenerated ? c.MultiLegParentRouteGUID : c.RouteGUID;
+  std::vector<RouteWaypointInfo> points;
+  wxString error;
+  if (!ExtractOpenCPNRouteWaypoints(guid, points, error)) {
+    WR_MessageBox(error, _("Edit route waypoints"), wxOK, this); return;
+  }
+  WR_MessageSheet picker(GetHandle(), wxID_CANCEL);
+  picker.setStyleSheet("QWidget {font-size: 17pt;} QComboBox, QPushButton {min-height: 72px;}");
+  auto* layout = new QVBoxLayout(&picker);
+  auto* note = new QLabel(QObject::tr("Choose a waypoint to move. Saving changes its position in every OpenCPN route that shares it. To remove it, use OpenCPN's route controls on the chart."));
+  note->setWordWrap(true); layout->addWidget(note);
+  auto* choice = new QComboBox;
+  choice->setItemDelegate(new WR_AndroidChoiceDelegate(choice));
+  int initial = 0;
+  for (size_t i = 0; i < points.size(); ++i) {
+    choice->addItem(QString::fromUtf8(wxString::Format("%d. %s", points[i].index, points[i].name).utf8_str()));
+    if (!initial && i && weather_routing::PositionsCoincide(points[i-1].lat, points[i-1].lon, points[i].lat, points[i].lon)) initial = int(i);
+  }
+  choice->setCurrentIndex(initial); layout->addWidget(choice);
+  auto* edit = new QPushButton(QObject::tr("Edit waypoint position"));
+  auto* chart = new QPushButton(QObject::tr("Show on chart"));
+  auto* cancel = new QPushButton(QObject::tr("Cancel"));
+  for (auto* button : {edit, chart, cancel}) layout->addWidget(button);
+  QObject::connect(edit, &QPushButton::clicked, &picker, [&] { picker.done(wxID_OK); });
+  QObject::connect(chart, &QPushButton::clicked, &picker, [&] { picker.done(wxID_APPLY); });
+  QObject::connect(cancel, &QPushButton::clicked, &picker, [&] { picker.done(wxID_CANCEL); });
+  picker.setGeometry(QApplication::primaryScreen()->availableGeometry().adjusted(40, 80, -40, -80));
+  const int answer = picker.exec();
+  if (answer != wxID_OK && answer != wxID_APPLY) return;
+  const auto point = points.at(choice->currentIndex());
+  if (answer == wxID_APPLY) {
+    ShowAndroidRouteOnChart(); JumpToPosition(point.lat, point.lon, .02); return;
+  }
+  wxString name = point.name;
+  double latitude = point.lat, longitude = point.lon;
+  if (!EditAndroidPosition(name, latitude, longitude, true) ||
+      (latitude == point.lat && longitude == point.lon)) return;
+  PlugIn_Waypoint latest;
+  if (!GetSingleWaypoint(point.guid, &latest) || latest.m_lat != point.lat || latest.m_lon != point.lon) {
+    WR_MessageBox(_("This waypoint changed while the editor was open. Reopen the editor before saving."), _("Waypoint changed"), wxOK, this); return;
+  }
+  latest.m_lat = latitude; latest.m_lon = longitude;
+  if (!UpdateSingleWaypoint(&latest)) {
+    WR_MessageBox(_("OpenCPN could not update this waypoint."), _("Waypoint not saved"), wxOK, this); return;
+  }
+  for (auto* entry : m_WeatherRoutes) {
+    auto* map = entry->routemapoverlay;
+    auto leg = map->GetConfiguration();
+    if (leg.StartGUID != point.guid && leg.EndGUID != point.guid && leg.RouteGUID != guid) continue;
+    leg.Update(); map->Reset(); map->SetConfiguration(leg); UpdateRouteMap(map);
+  }
+  RequestRefresh(GetOCPNCanvasWindow());
+  RefreshAndroidWorkspace();
+}
+
 void WeatherRouting::RefreshAndroidWorkspace() {
   if (!m_panel || !m_androidPlanStatus || !m_androidResultStatus) return;
+  RefreshAndroidPassageWeather();
   for (size_t i = 0; i < m_androidNavigation.size(); ++i)
     StyleTabletButton(m_androidNavigation[i], i == m_androidBook->GetSelection());
   wxString routeSignature = wxString::Format("%d:%d:",
@@ -857,6 +1061,7 @@ void WeatherRouting::RefreshAndroidWorkspace() {
     button->Enable(!m_RunningRouteMaps.empty() || !m_WaitingRouteMaps.empty() ||
                    m_ChartSafetyComputeProgressActive);
   RouteMapOverlay* selectedMap = FirstCurrentRouteMap();
+  RefreshAndroidReadiness(selectedMap);
   const bool hasResult = selectedMap && selectedMap->Finished() &&
                         selectedMap->ReachedDestination();
   bool allComplete = hasResult;
@@ -924,12 +1129,13 @@ void WeatherRouting::RefreshAndroidWorkspace() {
   }
   WR_WrapAndroidText(m_androidResultStatus, result,
       wxMax(300, m_androidResultStatus->GetParent()->GetClientSize().x - 80));
-  m_androidPlanStatus->GetParent()->Layout();
+  auto* planPage = wxDynamicCast(m_androidPlanStatus->GetParent(), wxScrolledWindow);
+  if (planPage) { planPage->Layout(); planPage->FitInside(); planPage->Layout(); }
   m_androidResultStatus->GetParent()->Layout();
 }
 
 bool WeatherRouting::EditAndroidPosition(wxString& name, double& latitude,
-                                        double& longitude) {
+                                        double& longitude, bool waypoint) {
   bool accepted = false;
   wxDialog dialog(this, wxID_ANY, _("Position"), wxDefaultPosition,
                   wxDefaultSize, wxDEFAULT_DIALOG_STYLE);
@@ -946,6 +1152,7 @@ bool WeatherRouting::EditAndroidPosition(wxString& name, double& latitude,
     return input;
   };
   auto* positionName = field(_("Name"), name);
+  positionName->Enable(!waypoint);
   auto* latitudeInput = field(_("Latitude (decimal degrees)"),
       wxString::Format("%.6f", latitude));
   auto* longitudeInput = field(_("Longitude (decimal degrees)"),

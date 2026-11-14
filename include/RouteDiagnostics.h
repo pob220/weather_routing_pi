@@ -2,12 +2,14 @@
 #pragma once
 
 #include <string>
+#include <optional>
 #include <vector>
 #include <wx/string.h>
 #include "supercpn/weather_routing/Types.h"
 
 namespace weather_routing {
 enum class DiagnosticSeverity { Error, Warning, Notice };
+enum class DiagnosticReview { Report, Weather, Boat, Route, RoutingControls };
 struct RouteDiagnostic {
   std::string code;
   DiagnosticSeverity severity{DiagnosticSeverity::Notice};
@@ -25,6 +27,9 @@ struct RouteDiagnosticReport {
   unsigned Count(DiagnosticSeverity severity) const;
   bool HasErrors() const { return Count(DiagnosticSeverity::Error) != 0; }
   wxString Summary() const;
+  // A known blocking reason, never an incidental warning or an inferred cause.
+  std::optional<RouteDiagnostic> PrimaryFailure() const;
+  DiagnosticReview FailureReview() const;
   wxString Text() const;
 };
 

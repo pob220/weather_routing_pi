@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "RouteDiagnostics.h"
+#ifdef __OCPN__ANDROID__
+#include "TimeZoneDisplay.h"
+#endif
 #include "supercpn/weather_routing/Engine.h"
 
 #include <algorithm>
@@ -17,6 +20,45 @@ bool Complete(wr::RoutingStatus status) {
       status == wr::RoutingStatus::CompleteUsingFrontierRecovery ||
       status == wr::RoutingStatus::CompleteUsingGraphFallback;
 }
+// ResourceLimitReached includes deliberate allowances and failed allocations.
+// Interpret only known engine reasons; retain unknown reasons without guessing
+// that the machine ran out of RAM. Engine statuses and raw evidence stay intact.
+wxString ResultStatusTitle(wr::RoutingStatus status, const std::string& reason) {
+  if (status != wr::RoutingStatus::ResourceLimitReached)
+    return RoutingStatusTitle(status);
+  if (reason == "retained lineage limit" ||
+      reason == "Quick2 retained-state allowance exhausted before finding a validated route")
+    return _("Search-history limit reached");
+  if (reason == "memory allocation failed" || reason == "Frontier allocation failed" ||
+      reason == "Atlas search memory allowance" ||
+      reason.starts_with("Quick allocation failed:"))
+    return _("Memory allocation failed");
+  if (reason == "geometry memory limit" || reason == "performance profile limit")
+    return _("Search-memory allowance reached");
+  if (reason == "contour nesting limit")
+    return _("Search-geometry limit reached");
+  if (reason == "wall-clock limit" || reason == "Comfort search time allowance reached")
+    return _("Calculation time allowance reached");
+  if (reason == "generated state limit" || reason == "geometry work limit" ||
+      reason == "weather query limit" ||
+      reason == "Quick2 search allowance exhausted before finding a validated route" ||
+      reason == "Quick attempted-motion allowance reached" ||
+      reason == "Quick weather-work allowance reached")
+    return _("Search allowance reached");
+  return RoutingStatusTitle(status);
+}
+
+wxString ResultFailureTitle(const wr::RoutingResult& result,
+                            wr::RoutingStatus status) {
+  if (status != wr::RoutingStatus::ResourceLimitReached ||
+      result.attemptFailures.empty())
+    return ResultStatusTitle(status, result.message);
+  const auto title = ResultStatusTitle(status, result.attemptFailures.front().detail);
+  for (const auto& attempt : result.attemptFailures)
+    if (ResultStatusTitle(attempt.status, attempt.detail) != title)
+      return RoutingStatusTitle(status);
+  return title;
+}
 wxString DurationText(long long seconds) {
   return wxString::Format(_("%lld h %02lld min"), seconds / 3600,
                           (seconds % 3600) / 60);
@@ -27,7 +69,7 @@ wxString PointText(wr::GeoPoint p) {
 wxString StatusAction(wr::RoutingStatus status) {
   switch (status) {
     case wr::RoutingStatus::WindForecastRequired:
-      return _("Open Configuration > Basic > Data Source. Check the selected wind source, provider and coverage for the route and UTC time.");
+      return _("Open Passage settings > Data Source. Check the selected wind source, provider and coverage for the route and UTC time.");
     case wr::RoutingStatus::CurrentDataRequired:
       return _("Supply current data covering the route and time, or deliberately review the Currents setting.");
     case wr::RoutingStatus::WaveDataRequired:
@@ -154,8 +196,14 @@ void Usage(RouteDiagnosticReport& report, const wr::RoutingResult& result,
 }  // namespace
 
 wxString DiagnosticTimeUtc(wr::TimePoint time) {
+#ifdef __OCPN__ANDROID__
+  return marine_time::FormatInTimeZone(
+      wxDateTime(static_cast<time_t>(time.time_since_epoch().count())),
+      "%Y-%m-%d %H:%M:%S", "UTC", false);
+#else
   return wxDateTime(static_cast<time_t>(time.time_since_epoch().count()))
       .Format("%Y-%m-%d %H:%M:%S", wxDateTime::UTC);
+#endif
 }
 wxString DiagnosticSeverityTitle(DiagnosticSeverity severity) {
   switch (severity) {
@@ -173,7 +221,7 @@ wxString RoutingStatusTitle(wr::RoutingStatus status) {
     case wr::RoutingStatus::CompleteUsingGraphFallback: return _("Complete");
     case wr::RoutingStatus::NoFeasibleRoute: return _("No validated complete route found");
     case wr::RoutingStatus::SearchIncomplete: return _("Search stopped before completion");
-    case wr::RoutingStatus::ResourceLimitReached: return _("Calculation allowance or memory limit reached");
+    case wr::RoutingStatus::ResourceLimitReached: return _("Calculation resource limit reached");
     case wr::RoutingStatus::WindForecastRequired: return _("Usable wind data are required");
     case wr::RoutingStatus::CurrentDataRequired: return _("Required current data are unavailable");
     case wr::RoutingStatus::WaveDataRequired: return _("Required wave-height coverage is unavailable");
@@ -200,6 +248,14 @@ unsigned RouteDiagnosticReport::Count(DiagnosticSeverity severity) const {
   return static_cast<unsigned>(std::count_if(items.begin(), items.end(),
       [severity](const auto& item) { return item.severity == severity; }));
 }
+std::optional<RouteDiagnostic> RouteDiagnosticReport::PrimaryFailure() const {
+  if (cancelled || complete) return std::nullopt;
+  const auto first = std::find_if(items.begin(), items.end(), [](const auto& item) {
+    return item.severity == DiagnosticSeverity::Error;
+  });
+  if (first != items.end()) return *first;
+  return std::nullopt;
+}
 wxString RouteDiagnosticReport::Summary() const {
   if (cancelled) return _("Stopped by user");
   const auto first = std::find_if(items.begin(), items.end(), [](const auto& item) {
@@ -213,6 +269,25 @@ wxString RouteDiagnosticReport::Summary() const {
     summary += warnings == 1 ? _(" (1 warning)")
                              : wxString::Format(_(" (%u warnings)"), warnings);
   return summary;
+}
+DiagnosticReview RouteDiagnosticReport::FailureReview() const {
+  const auto failure = PrimaryFailure();
+  if (!failure) return DiagnosticReview::Report;
+  if (failure->code == "setup.coincident_waypoints") return DiagnosticReview::Route;
+  if (failure->code == "runtime.weather") return DiagnosticReview::Weather;
+  if (!hasResult) return DiagnosticReview::Report;
+  switch (status) {
+    case wr::RoutingStatus::WindForecastRequired:
+    case wr::RoutingStatus::CurrentDataRequired:
+    case wr::RoutingStatus::WaveDataRequired: return DiagnosticReview::Weather;
+    case wr::RoutingStatus::InvalidPolar:
+    case wr::RoutingStatus::InvalidVesselConfiguration: return DiagnosticReview::Boat;
+    case wr::RoutingStatus::InvalidStart:
+    case wr::RoutingStatus::InvalidDestination: return DiagnosticReview::Route;
+    case wr::RoutingStatus::ResourceLimitReached:
+    case wr::RoutingStatus::SearchIncomplete: return DiagnosticReview::RoutingControls;
+    default: return DiagnosticReview::Report;
+  }
 }
 wxString RouteDiagnosticReport::Text() const {
   wxString text = context;
@@ -279,7 +354,7 @@ RouteDiagnosticReport CheckWindSourceSelection(bool useGrib,
         climatologySelected
             ? _("GRIB is not selected for this route and the selected climatology wind provider is unavailable. Wind displayed on the chart is not enabled for this calculation.")
             : _("Neither GRIB nor climatology wind is selected for this route. Wind displayed on the chart does not enable it for routing."),
-        _("Open Configuration > Basic > Data Source and select Grib, or configure an available climatology wind source."),
+        _("Open Passage settings > Data Source and select Grib, or configure an available climatology wind source."),
         {}, true});
   } else if (useGrib && climatologySelected && !climatologyProviderAvailable) {
     report.Add({"setup.climatology_unavailable", DiagnosticSeverity::Warning,
@@ -364,7 +439,7 @@ RouteDiagnosticReport DescribeRoutingResult(const wr::RoutingResult& result,
         RequiredAction(report, action);
     if (!report.HasErrors())
       report.Add({"result." + wr::toString(report.status),
-          DiagnosticSeverity::Error, RoutingStatusTitle(report.status),
+          DiagnosticSeverity::Error, ResultFailureTitle(result, report.status),
           wxString::FromUTF8(result.message.c_str()), StatusAction(report.status)});
   }
   if (report.cancelled)
@@ -420,8 +495,8 @@ RouteDiagnosticReport DescribeRoutingResult(const wr::RoutingResult& result,
   }
   if (report.complete && !result.attemptFailures.empty())
     report.Add({"sequence.incomplete", DiagnosticSeverity::Warning,
-        _("Some selected engines did not produce a complete route"),
-        wxString::Format(_("%u unsuccessful engine attempts; a validated result is available."),
+        _("Other engine attempts stopped; this route completed"),
+        wxString::Format(_("%u engine attempts did not complete; another engine produced a validated route."),
                          static_cast<unsigned>(result.attemptFailures.size())),
         _("Review the individual engine results below. Comparisons apply to the completed validated candidates.")});
   report.technical = wxString::FromUTF8(wr::toString(result.status).c_str()) +
@@ -438,7 +513,7 @@ RouteDiagnosticReport DescribeRoutingResult(const wr::RoutingResult& result,
       ? result.attemptFailures : result.engineAttempts;
   for (const auto& attempt : attemptHistory)
     report.technical += "\n" + wxString::FromUTF8(attempt.engine.c_str()) +
-        ": " + RoutingStatusTitle(attempt.status) + "\n" +
+        ": " + ResultStatusTitle(attempt.status, attempt.detail) + "\n" +
         wxString::FromUTF8(attempt.detail.c_str());
   for (const auto& reason : result.diagnostics.stageStopReasons)
     report.technical += "\n" + wxString::FromUTF8(reason.c_str());

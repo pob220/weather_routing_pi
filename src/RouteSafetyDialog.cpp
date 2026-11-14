@@ -58,7 +58,7 @@ Json::Value PointsJson(const std::vector<SafetyCheckWaypoint>& points) {
 
 RouteSafetyDialog::RouteSafetyDialog(weather_routing_pi& plugin,
     const wxString& route_guid, double minimum_depth_m, double land_margin_nm)
-    : wxDialog(plugin.GetParentWindow(), wxID_ANY, plugin.GetCommonName() + _(" — Check this route"),
+    : wxDialog(plugin.GetParentWindow(), wxID_ANY, plugin.GetCommonName() + _(L" — Check this route"),
                wxDefaultPosition, wxSize(860, 620), wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER),
       plugin_(plugin), route_guid_(route_guid), timer_(this) {
   auto* root = new wxBoxSizer(wxVERTICAL);
@@ -274,10 +274,10 @@ void RouteSafetyDialog::Start() {
   options.safety_margin_nm = margin;
   check_ = std::make_unique<RouteSafetyCheck>(std::move(points), options,
       weather_routing::chart_safety_host::ReviewSegment);
-  SetTitle(plugin_.GetCommonName() + _(" — Check this route: ") + route_name_);
+  SetTitle(plugin_.GetCommonName() + _(L" — Check this route: ") + route_name_);
   if (auto* config = GetOCPNConfigObject()) {
     const auto old_path = config->GetPath();
-    config->SetPath("/PlugIns/WeatherRouting/RouteCheck");
+    config->SetPath("/PlugIns/xWeatherRouting2/RouteCheck");
     config->Write("MinimumDepthM", depth); config->Write("LandMarginNM", margin);
     config->SetPath(old_path);
   }
@@ -340,7 +340,7 @@ void RouteSafetyDialog::RefreshReport() {
   if (check_->State() == RouteCheckState::Outdated || check_->State() == RouteCheckState::Invalid)
     text = wxGetTranslation(Utf8(check_->Error()));
   else if (check_->Clear()) text = _("Complete: no hazards found in the checks performed.");
-  else text = wxString::Format(_("%s — %zu/%zu sections checked; %zu hazard sections; %zu unverified sections."),
+  else text = wxString::Format(_(L"%s — %zu/%zu sections checked; %zu hazard sections; %zu unverified sections."),
       running ? _("Checking") : check_->State() == RouteCheckState::Cancelled ? _("Cancelled (partial report)") : _("Complete"),
       check_->Checked(), check_->Total(), check_->HazardChunks(), check_->UnverifiedChunks());
   text += check_->Options().check_depth ?
@@ -358,13 +358,13 @@ void RouteSafetyDialog::RefreshReport() {
     if (i >= findings_->GetItemCount()) findings_->InsertItem(i, wxString::Format("%zu", row.leg));
     findings_->SetItem(i, 1, wxGetTranslation(RouteSafetyCheck::Reason(row.status)));
     findings_->SetItem(i, 2, wxString::Format("%.5f, %.5f", row.lat, row.lon));
-    findings_->SetItem(i, 3, row.has_depth ? wxString::Format("%.2f", row.minimum_depth_m) : wxString("—"));
+    findings_->SetItem(i, 3, row.has_depth ? wxString::Format("%.2f", row.minimum_depth_m) : wxString(L"—"));
     findings_->SetItem(i, 4, row.chart_path.empty() ? wxGetTranslation(SourceName(row.source)) : wxFileName(Utf8(row.chart_path)).GetFullName());
   }
   if (selected_ >= 0 && selected_ < static_cast<long>(rows.size())) {
     const auto& row = rows[selected_];
     const auto& points = check_->Waypoints();
-    details_->ChangeValue(wxString::Format(_("Leg %zu: %s → %s\n%s (%.1f–%.1f%% along this leg)\nChart: %s\n%s"),
+    details_->ChangeValue(wxString::Format(_(L"Leg %zu: %s → %s\n%s (%.1f–%.1f%% along this leg)\nChart: %s\n%s"),
         row.leg, Utf8(points[row.leg - 1].name), Utf8(points[row.leg].name),
         wxGetTranslation(RouteSafetyCheck::Reason(row.status)), 100 * row.from_fraction, 100 * row.to_fraction,
         row.chart_path.empty() ? wxGetTranslation(SourceName(row.source)) : Utf8(row.chart_path), Utf8(row.message)));

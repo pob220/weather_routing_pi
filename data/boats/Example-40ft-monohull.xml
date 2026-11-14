@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<OpenCPNWeatherRoutingBoat version="2.0" creator="xWeatherRouting" example="true" name="Example 40 ft monohull - illustrative performance">
+<Polar FileName="Example/40ft-monohull-example.pol" Name="Example cruising polar" Source="Illustrative estimate" Notes="Example only; not measured performance for your vessel." CrossOverPercentage="0" LowWindPolicy="automatic" HighWindPolicy="strict"/>
+</OpenCPNWeatherRoutingBoat>

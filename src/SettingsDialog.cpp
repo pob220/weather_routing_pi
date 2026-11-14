@@ -409,7 +409,7 @@ SettingsDialog::~SettingsDialog() {
 
 void SettingsDialog::LoadSettings() {
   wxFileConfig* pConf = GetOCPNConfigObject();
-  pConf->SetPath(_T( "/PlugIns/WeatherRouting" ));
+  pConf->SetPath(_T( "/PlugIns/xWeatherRouting2" ));
 
   wxString CursorColorStr = m_cpCursorRoute->GetColour().GetAsString();
   pConf->Read(_T("CursorColor"), &CursorColorStr, CursorColorStr);
@@ -667,7 +667,7 @@ void SettingsDialog::LoadSettings() {
 
 void SettingsDialog::SaveSettings() {
   wxFileConfig* pConf = GetOCPNConfigObject();
-  pConf->SetPath(_T( "/PlugIns/WeatherRouting" ));
+  pConf->SetPath(_T( "/PlugIns/xWeatherRouting2" ));
 
   pConf->Write(_T("CursorColor"), m_cpCursorRoute->GetColour().GetAsString());
   pConf->Write(_T("DestinationColor"),
@@ -732,7 +732,7 @@ AddressSpaceMonitor* SettingsDialog::GetMonitor() {
 
 void SettingsDialog::LoadMemorySettings() {
   wxFileConfig* pConf = GetOCPNConfigObject();
-  pConf->SetPath(_T( "/PlugIns/WeatherRouting" ));
+  pConf->SetPath(_T( "/PlugIns/xWeatherRouting2" ));
 
   double threshold = 80.0;
   pConf->Read(_T("MemoryThreshold"), &threshold, 80.0);
@@ -784,7 +784,7 @@ void SettingsDialog::LoadMemorySettings() {
 
 void SettingsDialog::SaveMemorySettings() {
   wxFileConfig* pConf = GetOCPNConfigObject();
-  pConf->SetPath(_T( "/PlugIns/WeatherRouting" ));
+  pConf->SetPath(_T( "/PlugIns/xWeatherRouting2" ));
 
   pConf->Write(_T("MemoryThreshold"), m_spinThreshold->GetValue());
   pConf->Write(_T("MemorySuppressAlert"), m_checkSuppressAlert->GetValue());

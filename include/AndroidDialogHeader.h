@@ -326,6 +326,23 @@ inline void WR_StyleAndroidControls(wxWindow* parent) {
     if (button) WR_EnableAndroidButton(static_cast<wxButton*>(child));
     const bool check = wxDynamicCast(child, wxCheckBox) ||
                        wxDynamicCast(child, wxRadioButton);
+    if (check && !child->GetHandle()->property("wrButtonDrag").toBool()) {
+      child->GetHandle()->setProperty("wrButtonDrag", true);
+      new WR_AndroidButtonDragFilter(child->GetHandle());
+    }
+    if (auto* checkbox = wxDynamicCast(child, wxCheckBox)) {
+      auto* native = checkbox->GetHandle();
+      if (checkbox->Is3State() && !native->property("wrTwoStateClicks").toBool()) {
+        native->setProperty("wrTwoStateClicks", true);
+        // Mixed selections may display an indeterminate state. A user click
+        // must still select On/Off: this wxQt cycles through an ignored third
+        // state even without wxCHK_ALLOW_3RD_STATE_FOR_USER.
+        QObject::connect(native, &QAbstractButton::pressed, native,
+                         [native] { native->setTristate(false); });
+        QObject::connect(native, &QAbstractButton::released, native,
+                         [native] { native->setTristate(true); });
+      }
+    }
     const bool input = wxDynamicCast(child, wxTextCtrl) ||
                        wxDynamicCast(child, wxSpinCtrl) ||
                        wxDynamicCast(child, wxSpinCtrlDouble);

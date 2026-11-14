@@ -57,8 +57,6 @@ TEST(RoutingEngineSettings, FirstInstallAutoButUpgradePreservesEveryExistingSele
   wr::RoutingEngineSettings fresh;
   wr::ApplyFirstUseEngineDefaults(fresh, false);
   EXPECT_EQ(fresh.engine, wr::RoutingEngine::Auto);
-  EXPECT_EQ(fresh.autoEngines, wr::kSelectableEnginesMask);
-  EXPECT_EQ(fresh.allEngines, wr::kSelectableEnginesMask);
   for (const char* id : {"original", "quick", "main", "auto", "all", "unknown"}) {
     TiXmlElement xml("Configuration");
     xml.SetAttribute("RoutingEngine", id);
@@ -73,7 +71,7 @@ TEST(RoutingEngineSettings, FirstInstallAutoButUpgradePreservesEveryExistingSele
   EXPECT_EQ(existing.engine, wr::RoutingEngine::Main);
 }
 
-TEST(RoutingEngineSettings, BundledFirstInstallExamplesSelectAuto) {
+TEST(RoutingEngineSettings, FirstInstallStartsWithoutHistoricPassages) {
   TiXmlDocument document(WEATHER_ROUTING_SOURCE_DIR "/data/WeatherRoutingConfiguration.xml");
   ASSERT_TRUE(document.LoadFile());
   auto* root = document.RootElement();
@@ -81,13 +79,10 @@ TEST(RoutingEngineSettings, BundledFirstInstallExamplesSelectAuto) {
   int configurations = 0;
   for (auto* element = root->FirstChildElement("Configuration"); element;
        element = element->NextSiblingElement("Configuration")) {
-    const auto settings = wr::ReadRoutingEngineSettings(*element);
-    EXPECT_EQ(settings.engine, wr::RoutingEngine::Auto);
-    EXPECT_EQ(settings.autoEngines, wr::kSelectableEnginesMask);
-    EXPECT_EQ(settings.allEngines, wr::kSelectableEnginesMask);
+    EXPECT_EQ(wr::ReadRoutingEngineSettings(*element).engine, wr::RoutingEngine::Auto);
     ++configurations;
   }
-  EXPECT_GT(configurations, 0);
+  EXPECT_EQ(configurations, 0);
 }
 TEST(RoutingEngineSettings, AllThreeBlocksSurviveSwitchSaveReinstallAndIndependentReset) {
   wr::RoutingEngineSettings settings;

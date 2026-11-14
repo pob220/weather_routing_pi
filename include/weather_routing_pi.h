@@ -226,6 +226,11 @@ public:
   }
 
   wxWindow* GetParentWindow() { return m_parent_window; }
+  bool CopyLastViewport(PlugIn_ViewPort& viewport) const {
+    if (!m_route_check_viewport_valid) return false;
+    viewport = m_route_check_viewport;
+    return true;
+  }
   /** Same read-only action as the native route menu, for the touch workspace. */
   void CheckExistingRoute(const wxString& route_guid) {
     StartRouteSafetyCheck(route_guid);
@@ -303,6 +308,7 @@ private:
 
   WeatherRouting* m_pWeather_Routing;
   wxDateTime m_GribTime;
+  wxString m_climatology_dataset;
 
   int m_display_width, m_display_height;
   int m_leftclick_tool_id;

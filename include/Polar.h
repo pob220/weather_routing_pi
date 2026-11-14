@@ -221,6 +221,9 @@ public:
   bool Save(const wxString& filename);
 
   wxString FileName;
+  // Optional descriptive metadata is stored in the boat XML. Existing .pol
+  // tables and older boat files remain valid; absent provenance stays unknown.
+  wxString Name, Source, SailConfiguration, Notes, Modified;
 
   void OptimizeTackingSpeeds();
   /**

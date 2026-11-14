@@ -687,7 +687,7 @@ void RoutingTablePanel::LoadColumnVisibility() {
   wxFileConfig* config = GetOCPNConfigObject();
   if (!config) return;
   const wxString previousPath = config->GetPath();
-  config->SetPath(_T("/PlugIns/WeatherRouting/WeatherTable"));
+  config->SetPath(_T("/PlugIns/xWeatherRouting2/WeatherTable"));
   for (int col = 0; col < COL_COUNT; ++col) {
     bool visible = true;
     config->Read(wxString::Format("ColumnVisible_%d", col), &visible, true);
@@ -700,7 +700,7 @@ void RoutingTablePanel::SaveColumnVisibility() const {
   wxFileConfig* config = GetOCPNConfigObject();
   if (!config) return;
   const wxString previousPath = config->GetPath();
-  config->SetPath(_T("/PlugIns/WeatherRouting/WeatherTable"));
+  config->SetPath(_T("/PlugIns/xWeatherRouting2/WeatherTable"));
   for (int col = 0; col < COL_COUNT; ++col)
     config->Write(wxString::Format("ColumnVisible_%d", col),
                   m_columnVisible[static_cast<std::size_t>(col)]);
