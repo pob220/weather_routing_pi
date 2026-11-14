@@ -23,3 +23,10 @@ absent/out-of-range viewer clock and preserved an in-range clock; the saved epoc
 matched. The Android hardware record is in QUALIFICATION-2.2.6.md and covers the
 xWeather identity. Further platform qualification and Rick's testing precede any
 alpha or catalogue publication.
+
+The canonical arm64 Android library and import archive also build against the
+pinned stock 5.14 host. TLS isolation, 16 KiB ELF alignment, import metadata and
+shoreline-package checks pass. All 1,013 wx imports resolve against both that
+stock host and the actual tablet's 5.15 host. This is build/ABI qualification;
+the hardware workflow was exercised with the xWeather identity, not by replacing
+the tablet's navigation profile with the canonical variant.
