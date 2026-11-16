@@ -1,0 +1,28 @@
+name: Mac startup diagnostic 1.36.5
+on:
+  push:
+    branches: [ci/macos-startup-diagnostics-1.36.5]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  macos-startup:
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      WEATHER_ROUTING_API_HEADER_VERSION: '1.22'
+      WEATHER_ROUTING_CI_XWEATHER: 'false'
+      CMAKE_BUILD_PARALLEL_LEVEL: '3'
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Native stock-host startup qualification
+        run: bash ci/circleci-build-macos-universal.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macos-startup-diagnostic-1.36.5
+          path: artifacts/macos-arm64
+          if-no-files-found: warn
