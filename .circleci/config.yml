@@ -436,11 +436,34 @@ validation-filters: &validation-filters
     ignore: /.*/
 
 workflows:
+  unix-plugin-packages:
+    when:
+      and:
+        - not: << pipeline.parameters.run_workflow_deploy >>
+        - matches:
+            pattern: "^packaging/unix-.*"
+            value: << pipeline.git.branch >>
+    jobs:
+      - publication-contracts
+      - linux-catalogue:
+          name: debian12-x86_64
+          target: bookworm
+          image: debian:bookworm
+      - linux-catalogue:
+          name: debian13-x86_64
+          target: trixie
+          image: debian:trixie
+      - macos-universal
+
   validate:
     when:
       and:
         - not: << pipeline.parameters.run_workflow_deploy >>
         - not: << pipeline.parameters.run_windows_only >>
+        - not:
+            matches:
+              pattern: "^packaging/unix-.*"
+              value: << pipeline.git.branch >>
         - not: << pipeline.parameters.run_catalogue_pr >>
     jobs:
       - publication-contracts
