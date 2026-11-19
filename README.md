@@ -1,33 +1,132 @@
-Weather Routing Plugin for OpenCPN
-===========================================
+# Weather Routing integration branch
 
-Perform weather routing, see "data/WeatherRoutingInformation.html"
+See [the 1.29.1 integration summary](docs/integration-1.29.1.md),
+[1.29.1 changes](docs/release-1.29.1.md),
+[stock-host compatibility](docs/release-1.27.0.md) and
+[Quick, Standard and Professional settings](docs/quick-routing.md).
 
-Compiling
-=========
+The optional hardened-OpenCPN planning-provider boundary is documented in
+[docs/external_control_provider_preview_b.md](docs/external_control_provider_preview_b.md).
+Stock OpenCPN remains supported through the unchanged plug-in API 1.21.
 
-* git clone git://github.com/seandepagnier/weather_routing_pi.git
+This branch integrates the fully working xWeatherRouting developments back
+into the current standard OpenCPN Weather Routing plugin. It retains the
+standard plugin identity, settings, polar and GRIB integrations while adding
+the modern deterministic routing engine developed and qualified in the
+xWeatherRouting branch.
 
-Under windows, you must find the file "opencpn.lib" (Visual Studio) or "libopencpn.dll.a" (mingw) which is built in the build directory after compiling opencpn.  This file must be copied to the plugin directory.
+The plugin currently provides:
 
-Build as normally:
+- consistent wave-height checks and coverage warnings across routing engines,
+  optional required wave coverage, and explicit anchoring waits with locations
+  and durations in the route report;
+- threshold-based motoring when sailing performance is insufficient, bounded
+  polar wind policies, reversible route visibility, explicit result clearing
+  and selected/all/manual departure display modes;
+- a read-only **Check this route** action in the OpenCPN route context menu
+  (v1.25). It reports land crossings, drying areas, charted hazards, land
+  clearance, optional minimum charted depth and unavailable chart/depth data.
+  Findings appear in a per-leg report and as temporary chart markers. Click
+  a marker to select its report entry, or select an entry and choose
+  **Show selected finding**. **Recheck** uses the latest route and chart state;
+  closing the report removes its markers. Cancellation leaves an explicitly
+  partial report. The checked route and its waypoints are never changed;
+- deterministic adaptive forward isochrones, reverse recovery and
+  time-dependent graph fallback;
+- preservation of useful suboptimal lineages for difficult coastal routes;
+- departure-time optimisation with independently isolated workers;
+- planned-arrival routing, including determination of the required departure
+  time;
+- UTC routing internally with optional IANA local-time display in the UI;
+- dense independent route validation and standard GSHHS land checks;
+- optional enhanced chart-backed hazard checks when the OpenCPN host exposes
+  the dynamically detected experimental service.
 
-* cd ..
-* cd build
-* cmake ..
-* make
-* make install
+The same binary loads on an unmodified stock OpenCPN host. Stock OpenCPN does
+not expose the optional chart-backed service, so Weather Routing disables
+those two controls and continues to use the standard GSHHS checks.
+There is no direct enhanced-core symbol dependency.
 
-For OSX standalone build in weather_routing_pi directory:
-* mkdir build
-* cd build
-* cmake ..
-* make
-* make create-pkg
+Route checking also requires the compatible chart-safety host. It checks the
+rhumb-line legs between the route's existing waypoints using authoritative
+chart queries, independently of the routing engines. Depth is at chart datum;
+entering zero disables depth checks, and the report states this explicitly.
+Android retains the established Plan / Routes / Results / Tools workspace.
+Tools → Route management → Check this route opens the same read-only checker
+through a touch route picker, with stacked settings, scrollable findings and
+persistent Close/Back actions. Stock OpenCPN Android lacks the optional chart
+safety service and reports that checking is unavailable; ordinary routing and
+its GSHHG land checks remain available.
+The checker does not evaluate traffic rules, restricted-area conditions,
+bridge clearance or tide height. Reports become outdated when the route,
+chart selection or chart identity changes. Version 1.27 pairs the existing
+plugin with the optional geometry-based core improvements described in its
+release notes. Real S-63 cells still require separate qualification; this
+release does not claim a new S-63 provider integration.
 
-License
-=======
-The plugin code is licensed under the terms of the GPL v3+ 
+Fresh installations leave both optional chart/depth controls unchecked.
+Users of an enhanced OpenCPN host can opt in; explicit choices made by
+existing users are preserved. The established `/PlugIns/WeatherRouting`
+settings and user-data layout remain unchanged. Upgrading from v1.24 preserves
+customized boat and polar files without prompting to replace them.
 
-Part of the icons made by Smashicons (https://www.flaticon.com/authors/smashicons) from Flaticon (https://www.flaticon.com/) and is licensed under CC BY 3.0 (http://creativecommons.org/licenses/by/3.0)
+## Building
 
+For a clean standalone build against the vendored stock OpenCPN 1.21 API:
+
+```sh
+cmake -S . -B build-release -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DWEATHER_ROUTING_STANDALONE_API=ON \
+  -DOCPN_BUILD_TEST=OFF
+cmake --build build-release --parallel
+cmake --build build-release --target package
+```
+
+For the separate xWeatherRouting identity, also set
+`-DWEATHER_ROUTING_XWEATHER_IDENTITY=ON`.
+
+Keep release packaging in a build directory where tests are disabled. This
+prevents test-only GoogleTest libraries from being included by older
+packaging infrastructure.
+
+## Testing
+
+For real-GRIB smoke tests in a separate OpenCPN profile, see the
+[headless testing kit](tools/headless-testing/). It includes a Python runner,
+timing extractor, example scenario and setup instructions.
+
+```sh
+cmake -S . -B build-test -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DWEATHER_ROUTING_STANDALONE_API=ON \
+  -DOCPN_BUILD_TEST=ON
+cmake --build build-test --parallel
+ctest --test-dir build-test --output-on-failure --parallel
+```
+
+The native engine, deterministic resource policies, planned-arrival planner,
+timezone lifecycle, route validation, chart-cache data structures and
+supporting geometry are covered by the test suite. Stock-host compatibility
+must also be checked by loading the clean package in an unmodified OpenCPN
+5.14 or later installation.
+
+Further architecture and validation details are in
+[`docs/modern_native_engine.md`](docs/modern_native_engine.md) and
+[`docs/chart_safety_cache.md`](docs/chart_safety_cache.md).
+
+For the wxWidgets 3.2 and 3.3.4 build variants and matching Windows x64
+packages, see [`docs/release-1.35.0.md`](docs/release-1.35.0.md).
+
+## Status
+
+The package, library, catalogue and UI use the standard identity:
+`weather_routing_pi` / WeatherRouting. Cross-platform artifacts may be built
+for validation, but publishing or opening an upstream pull request is a
+separate release decision.
+
+## Licence and acknowledgement
+
+The plugin is GPL v3 or later. The original Weather Routing plugin was written
+by Sean D'Epagnier and has benefited from many OpenCPN contributors,
+translators and testers. This integration preserves that lineage and licence.

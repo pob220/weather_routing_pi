@@ -1,9 +1,4 @@
 /***************************************************************************
- *
- * Project:  OpenCPN Weather Routing plugin
- * Author:   Sean D'Epagnier
- *
- ***************************************************************************
  *   Copyright (C) 2015 by Sean D'Epagnier                                 *
  *                                                                         *
  *   This program is free software; you can redistribute it and/or modify  *
@@ -19,32 +14,30 @@
  *   You should have received a copy of the GNU General Public License     *
  *   along with this program; if not, write to the                         *
  *   Free Software Foundation, Inc.,                                       *
- *   51 Franklin Street, Fifth Floor, Boston, MA 02110-1301,  USA.             *
- ***************************************************************************
- */
+ *   51 Franklin Street, Fifth Floor, Boston, MA 02110-1301,  USA.         *
+ **************************************************************************/
 
 #ifndef _WEATHER_ROUTING_FILTER_ROUTES_H_
 #define _WEATHER_ROUTING_FILTER_ROUTES_H_
 
 #include "WeatherRoutingUI.h"
 
-class FilterRoutesDialog : public FilterRoutesDialogBase
-{
+class FilterRoutesDialog : public FilterRoutesDialogBase {
 public:
-    enum Filters {START, STARTTIME, END, BOATFILENAME, STATE, NUM_FILTERS};
+  enum Filters { START, STARTTIME, END, BOATFILENAME, STATE, NUM_FILTERS };
 
-    FilterRoutesDialog( WeatherRouting *weatherrouting );
+  FilterRoutesDialog(WeatherRouting* weatherrouting);
 
-    void OnCategory( wxCommandEvent& event );
-    void OnFilterText( wxCommandEvent& event );
-    void OnResetAll( wxCommandEvent& event );
-    void OnDone( wxCommandEvent& event );
+  void OnCategory(wxCommandEvent& event);
+  void OnFilterText(wxCommandEvent& event);
+  void OnResetAll(wxCommandEvent& event);
+  void OnDone(wxCommandEvent& event);
 
 private:
-    void ApplyFilters();
-    wxString m_Filters[NUM_FILTERS];
+  void ApplyFilters();
+  wxString m_Filters[NUM_FILTERS];
 
-    WeatherRouting *m_WeatherRouting;
+  WeatherRouting* m_WeatherRouting;
 };
 
 #endif
